@@ -3,6 +3,10 @@ import './lib/styles/plugin-control.css';
 
 // Main entry point - Core exports
 export { PluginControl } from './lib/core/PluginControl';
+export { authenticateWithServiceAccount, parseServiceAccountFromEnv } from './lib/ee/auth';
+export { renderEeLayer } from './lib/ee/layer';
+export { fetchCatalogs, filterCatalog, queryCatalog, groupCatalogByCategory } from './lib/ee/catalog';
+export { requestTileUrl, createEndpointClient, parseTileUrlFromResponse } from './lib/ee/endpoint';
 
 // Type exports
 export type {

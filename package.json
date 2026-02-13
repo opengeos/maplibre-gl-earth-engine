@@ -1,7 +1,7 @@
 {
-  "name": "maplibre-gl-plugin-template",
-  "version": "0.2.2",
-  "description": "A template for creating MapLibre GL JS plugins with TypeScript and React support",
+  "name": "maplibre-gl-earth-engine",
+  "version": "0.3.0",
+  "description": "MapLibre GL control for Google Earth Engine catalogs, authentication, and layer rendering",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
@@ -27,7 +27,7 @@
         "default": "./dist/react.cjs"
       }
     },
-    "./style.css": "./dist/maplibre-gl-plugin-template.css"
+    "./style.css": "./dist/maplibre-gl-earth-engine.css"
   },
   "files": [
     "dist",
@@ -47,7 +47,8 @@
     "test:coverage": "vitest --coverage",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "ee:smoke": "DOTENV_CONFIG_PATH=.env node -r dotenv/config ./scripts/ee-smoke.mjs"
   },
   "keywords": [
     "maplibre",
@@ -97,5 +98,9 @@
     "vite": "^6.0.0",
     "vite-plugin-dts": "^4.3.0",
     "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "@google/earthengine": "^1.7.13",
+    "dotenv": "^16.6.1"
   }
 }
