@@ -8,6 +8,9 @@ const DEFAULT_STATE: PluginState = {
   collapsed: true,
   panelWidth: 300,
   data: {},
+  status: 'Ready',
+  selectedAssetId: 'USGS/SRTMGL1_003',
+  authenticated: false,
 };
 
 /**

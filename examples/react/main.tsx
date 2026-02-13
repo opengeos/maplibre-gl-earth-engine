@@ -39,9 +39,7 @@ function App() {
     };
   }, []);
 
-  const handleStateChange = (newState: typeof state) => {
-    console.log('Plugin state changed:', newState);
-  };
+  const handleStateChange = (_newState: typeof state) => {};
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
