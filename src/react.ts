@@ -8,7 +8,9 @@ export { usePluginState } from './lib/hooks';
 export type {
   PluginControlOptions,
   PluginState,
+  PluginStatus,
   PluginControlReactProps,
   PluginControlEvent,
   PluginControlEventHandler,
 } from './lib/core/types';
+export type { VisualizeOptions } from './lib/ee/layer';

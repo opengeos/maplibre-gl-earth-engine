@@ -1,20 +1,25 @@
 import ee from '@google/earthengine';
 import type { Map } from 'maplibre-gl';
 
-export interface VisualizeOptions {
-  bands?: string;
-  min?: number;
-  max?: number;
-  palette?: string;
+export type VisualizeOptions = Record<string, unknown> & {
+  bands?: string | string[];
+  min?: number | number[];
+  max?: number | number[];
+  palette?: string | string[];
+  gamma?: number | number[];
   opacity?: number;
-}
+};
 
 export type EeRenderable = string | object;
 
-export interface RenderResult {
+export interface TileLayerResult {
   sourceId: string;
   layerId: string;
   tileUrl: string;
+}
+
+export interface RenderResult extends TileLayerResult {
+  eeObject: object;
 }
 
 interface MapIdResponse {
@@ -39,17 +44,18 @@ function errorMessage(error: unknown): string {
   return String(error ?? 'Unknown Earth Engine error');
 }
 
-function mapIdForObject(input: object, vis: VisualizeOptions): Promise<{ urlFormat: string }> {
+function mapIdForObject(input: object, vis: VisualizeOptions): Promise<{ urlFormat: string; eeObject: object }> {
   const obj = input as EeObjectWithMapId;
   if (typeof obj.getMapId !== 'function') {
     return Promise.reject(new Error('Earth Engine object does not support map rendering.'));
   }
 
   const visParams: Record<string, unknown> = {};
-  if (vis.bands) visParams.bands = vis.bands;
-  if (vis.min !== undefined) visParams.min = vis.min;
-  if (vis.max !== undefined) visParams.max = vis.max;
-  if (vis.palette) visParams.palette = vis.palette;
+  Object.entries(vis).forEach(([key, value]) => {
+    if (key !== 'opacity' && value !== undefined && value !== null) {
+      visParams[key] = value;
+    }
+  });
 
   return new Promise((resolve, reject) => {
     try {
@@ -62,7 +68,7 @@ function mapIdForObject(input: object, vis: VisualizeOptions): Promise<{ urlForm
           reject(new Error('Earth Engine map response is missing urlFormat.'));
           return;
         }
-        resolve({ urlFormat: mapInfo.urlFormat });
+        resolve({ urlFormat: mapInfo.urlFormat, eeObject: input });
       });
     } catch (error) {
       reject(error);
@@ -70,7 +76,10 @@ function mapIdForObject(input: object, vis: VisualizeOptions): Promise<{ urlForm
   });
 }
 
-async function mapIdForRenderable(input: EeRenderable, vis: VisualizeOptions): Promise<{ urlFormat: string }> {
+async function mapIdForRenderable(input: EeRenderable, vis: VisualizeOptions): Promise<{
+  urlFormat: string;
+  eeObject: object;
+}> {
   if (typeof input !== 'string') {
     return mapIdForObject(input, vis);
   }
@@ -99,7 +108,7 @@ export function addTileUrlLayer(
   vis: VisualizeOptions,
   sourceId = 'ee-source',
   layerId = 'ee-layer',
-): RenderResult {
+): TileLayerResult {
   if (map.getLayer(layerId)) {
     map.removeLayer(layerId);
   }
@@ -133,5 +142,8 @@ export async function renderEeLayer(
   layerId = 'ee-layer',
 ): Promise<RenderResult> {
   const mapInfo = await mapIdForRenderable(input, vis);
-  return addTileUrlLayer(map, mapInfo.urlFormat, vis, sourceId, layerId);
+  return {
+    ...addTileUrlLayer(map, mapInfo.urlFormat, vis, sourceId, layerId),
+    eeObject: mapInfo.eeObject,
+  };
 }

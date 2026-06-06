@@ -45,11 +45,55 @@ interface LoadedLayerState {
   sourceId: string;
   layerId: string;
   name: string;
+  input: string | object;
+  eeObject: object;
+  vis: VisualizeOptions;
   assetId?: string;
   opacity: number;
   visible: boolean;
   addedAt: number;
   tileUrl: string;
+}
+
+interface CodeEditorMapLayer {
+  getName: () => string;
+  setName: (name: string) => CodeEditorMapLayer;
+  getShown: () => boolean;
+  setShown: (shown: boolean) => CodeEditorMapLayer;
+  getOpacity: () => number;
+  setOpacity: (opacity: number) => CodeEditorMapLayer;
+}
+
+interface PendingCodeEditorLayer {
+  eeObject: string | object;
+  vis: VisualizeOptions;
+  name: string;
+  shown: boolean;
+  layer?: CodeEditorMapLayer & { loadedLayer?: LoadedLayerState };
+}
+
+interface CodeEditorMapAdapter {
+  addLayer: (
+    eeObject: string | object,
+    visParams?: VisualizeOptions | null,
+    name?: string,
+    shown?: boolean,
+    opacity?: number,
+  ) => CodeEditorMapLayer;
+  setCenter: (lon: number, lat: number, zoom?: number) => CodeEditorMapAdapter;
+  centerObject: (object: unknown, zoom?: number, onComplete?: () => void) => CodeEditorMapAdapter;
+  getCenter: () => unknown;
+  getZoom: () => number;
+  getBounds: (options?: { asGeoJSON?: boolean }) => unknown;
+  getScale: () => number;
+  getMapLibreMap: () => MapLibreMap | undefined;
+}
+
+interface CodeEditorMapExecution {
+  map: CodeEditorMapAdapter;
+  layerRequests: PendingCodeEditorLayer[];
+  viewportRequests: Array<() => Promise<void>>;
+  hasActions: () => boolean;
 }
 
 const TABS: Array<{ id: string; label: string }> = [
@@ -90,9 +134,9 @@ export class PluginControl implements IControl {
   private _layersListEl?: HTMLElement;
   private _inspectorActive = false;
   private _inspectorClickHandler?: (e: { lngLat: { lng: number; lat: number } }) => void;
+  private _inspectorLayerSelect?: HTMLSelectElement;
   private _inspectorLonInput?: HTMLInputElement;
   private _inspectorLatInput?: HTMLInputElement;
-  private _inspectorImageScript?: HTMLTextAreaElement;
   private _inspectorScaleInput?: HTMLInputElement;
   private _inspectorResultsEl?: HTMLElement;
   private _previousMapCursor?: string;
@@ -233,14 +277,42 @@ export class PluginControl implements IControl {
     if (!this._map) throw new Error('Control is not attached to a map.');
     this._setStatus('Running script…');
 
-    const fn = new Function('ee', `${script}`) as (eeNs: typeof ee) => unknown;
-    const result = fn(ee);
-    const target: string | object = typeof result === 'string' ? result : (result as object);
-    if (!target) throw new Error('Script must return an asset ID string or an ee object.');
+    const codeEditorMap = this._createCodeEditorMapExecution();
+    const fn = new Function('ee', 'Map', `${script}`) as (
+      eeNs: typeof ee,
+      mapAdapter: CodeEditorMapAdapter,
+    ) => unknown;
+    const result = fn(ee, codeEditorMap.map);
+    const target = this._renderableScriptResult(result);
+    if (result !== undefined && !target) {
+      throw new Error('Script return value must be an asset ID string or an Earth Engine object.');
+    }
+    if (!target && !codeEditorMap.hasActions()) {
+      throw new Error('Script must return an asset ID or EE object, or call Map.addLayer/Map.setCenter/Map.centerObject.');
+    }
 
-    await this.authenticate();
-    await this._renderManagedLayer(target, vis, { name: 'Script layer' });
-    this._setStatus('Script rendered successfully.');
+    if (target || codeEditorMap.layerRequests.length || codeEditorMap.viewportRequests.length) {
+      await this.authenticate();
+    }
+
+    for (const request of codeEditorMap.viewportRequests) {
+      await request();
+    }
+
+    for (const request of codeEditorMap.layerRequests) {
+      const layer = await this._renderManagedLayer(request.eeObject, request.vis, {
+        name: request.name,
+        shown: request.shown,
+      });
+      if (request.layer) request.layer.loadedLayer = layer;
+    }
+
+    if (target) {
+      await this._renderManagedLayer(target, vis, { name: 'Script layer' });
+    }
+
+    const layerCount = codeEditorMap.layerRequests.length + (target ? 1 : 0);
+    this._setStatus(layerCount ? `Script added ${layerCount} layer${layerCount === 1 ? '' : 's'}.` : 'Script completed.');
   }
 
   toggle(): void {
@@ -336,7 +408,7 @@ export class PluginControl implements IControl {
   private async _renderManagedLayer(
     input: string | object,
     vis: VisualizeOptions,
-    meta: { name: string; assetId?: string },
+    meta: { name: string; assetId?: string; shown?: boolean },
     existing?: LoadedLayerState,
   ): Promise<LoadedLayerState> {
     if (!this._map) throw new Error('Control is not attached to a map.');
@@ -347,9 +419,12 @@ export class PluginControl implements IControl {
       sourceId: result.sourceId,
       layerId: result.layerId,
       name: meta.name,
+      input,
+      eeObject: result.eeObject,
+      vis: { ...vis },
       assetId: meta.assetId,
       opacity: vis.opacity ?? existing?.opacity ?? 1,
-      visible: existing?.visible ?? true,
+      visible: meta.shown ?? existing?.visible ?? true,
       addedAt: existing?.addedAt ?? Date.now(),
       tileUrl: result.tileUrl,
     };
@@ -364,6 +439,7 @@ export class PluginControl implements IControl {
     this._applyLayerVisibility(layerState);
     this._applyLayerOpacity(layerState);
     this._renderLayersList();
+    this._renderInspectorLayerOptions();
     return layerState;
   }
 
@@ -376,6 +452,7 @@ export class PluginControl implements IControl {
     this._layers = this._layers.filter((item) => item.id !== layerId);
     if (this._loadedLayer?.id === layerId) this._loadedLayer = this._layers[this._layers.length - 1];
     this._renderLayersList();
+    this._renderInspectorLayerOptions();
   }
 
   private _applyLayerOpacity(layer: LoadedLayerState): void {
@@ -388,11 +465,216 @@ export class PluginControl implements IControl {
     this._map.setLayoutProperty(layer.layerId, 'visibility', layer.visible ? 'visible' : 'none');
   }
 
-  private _runEeScript(script: string): unknown {
-    const fn = new Function('ee', `${script}`) as (eeNs: typeof ee) => unknown;
-    const result = fn(ee);
-    if (!result) throw new Error('Script must return an Earth Engine object.');
-    return result;
+  private _renderableScriptResult(result: unknown): string | object | undefined {
+    if (typeof result === 'string') return result;
+    if (result && typeof result === 'object') return result;
+    return undefined;
+  }
+
+  private _normalizeVisParams(visParams?: VisualizeOptions | null): VisualizeOptions {
+    return visParams ? { ...visParams } : {};
+  }
+
+  private _createCodeEditorLayer(
+    request: PendingCodeEditorLayer,
+  ): CodeEditorMapLayer & { loadedLayer?: LoadedLayerState } {
+    const layer: CodeEditorMapLayer & { loadedLayer?: LoadedLayerState } = {
+      getName: () => request.name,
+      setName: (name: string) => {
+        request.name = name || request.name;
+        if (layer.loadedLayer) {
+          layer.loadedLayer.name = request.name;
+          this._renderLayersList();
+        }
+        return layer;
+      },
+      getShown: () => request.shown,
+      setShown: (shown: boolean) => {
+        request.shown = Boolean(shown);
+        if (layer.loadedLayer) {
+          layer.loadedLayer.visible = request.shown;
+          this._applyLayerVisibility(layer.loadedLayer);
+          this._renderLayersList();
+        }
+        return layer;
+      },
+      getOpacity: () => Number(request.vis.opacity ?? 1),
+      setOpacity: (opacity: number) => {
+        request.vis.opacity = this._clampOpacity(opacity);
+        if (layer.loadedLayer) {
+          layer.loadedLayer.opacity = Number(request.vis.opacity);
+          this._applyLayerOpacity(layer.loadedLayer);
+          this._renderLayersList();
+        }
+        return layer;
+      },
+    };
+    return layer;
+  }
+
+  private _createCodeEditorMapExecution(): CodeEditorMapExecution {
+    const layerRequests: PendingCodeEditorLayer[] = [];
+    const viewportRequests: Array<() => Promise<void>> = [];
+    let immediateActionCount = 0;
+
+    const adapter: CodeEditorMapAdapter = {
+      addLayer: (
+        eeObject: string | object,
+        visParams?: VisualizeOptions | null,
+        name?: string,
+        shown = true,
+        opacity?: number,
+      ): CodeEditorMapLayer => {
+        if (!eeObject) throw new Error('Map.addLayer requires an Earth Engine object or raw map ID.');
+        const vis = this._normalizeVisParams(visParams);
+        vis.opacity = this._clampOpacity(opacity ?? vis.opacity ?? 1);
+        const request: PendingCodeEditorLayer = {
+          eeObject,
+          vis,
+          name: name || `Layer ${this._layers.length + layerRequests.length + 1}`,
+          shown,
+        };
+        const layer = this._createCodeEditorLayer(request);
+        request.layer = layer;
+        layerRequests.push(request);
+        return layer;
+      },
+      setCenter: (lon: number, lat: number, zoom?: number): CodeEditorMapAdapter => {
+        this._setMapCenter(lon, lat, zoom);
+        immediateActionCount += 1;
+        return adapter;
+      },
+      centerObject: (object: unknown, zoom?: number, onComplete?: () => void): CodeEditorMapAdapter => {
+        viewportRequests.push(() => this._centerMapOnEeObject(object, zoom, onComplete));
+        return adapter;
+      },
+      getCenter: (): unknown => {
+        const center = this._map?.getCenter();
+        if (!center) return undefined;
+        return ee.Geometry.Point([center.lng, center.lat]);
+      },
+      getZoom: (): number => this._map?.getZoom() ?? 0,
+      getBounds: (options?: { asGeoJSON?: boolean }): unknown => this._getMapBounds(options),
+      getScale: (): number => this._getApproximateMapScale(),
+      getMapLibreMap: (): MapLibreMap | undefined => this._map,
+    };
+
+    return {
+      map: adapter,
+      layerRequests,
+      viewportRequests,
+      hasActions: () => immediateActionCount > 0 || layerRequests.length > 0 || viewportRequests.length > 0,
+    };
+  }
+
+  private _clampOpacity(value: unknown): number {
+    const opacity = Number(value);
+    if (!Number.isFinite(opacity)) return 1;
+    return Math.min(Math.max(opacity, 0), 1);
+  }
+
+  private _setMapCenter(lon: number, lat: number, zoom?: number): void {
+    if (!this._map) throw new Error('Control is not attached to a map.');
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+      throw new Error('Map.setCenter requires numeric longitude and latitude.');
+    }
+    const center: [number, number] = [lon, lat];
+    if (zoom === undefined) {
+      this._map.setCenter(center);
+      return;
+    }
+    if (!Number.isFinite(zoom)) throw new Error('Map.setCenter zoom must be numeric.');
+    this._map.jumpTo({ center, zoom });
+  }
+
+  private _getMapBounds(options?: { asGeoJSON?: boolean }): unknown {
+    const bounds = this._map?.getBounds();
+    if (!bounds) return undefined;
+    const west = bounds.getWest();
+    const south = bounds.getSouth();
+    const east = bounds.getEast();
+    const north = bounds.getNorth();
+    if (!options?.asGeoJSON) return [west, south, east, north];
+    return {
+      type: 'Polygon',
+      coordinates: [
+        [
+          [west, south],
+          [east, south],
+          [east, north],
+          [west, north],
+          [west, south],
+        ],
+      ],
+    };
+  }
+
+  private _getApproximateMapScale(): number {
+    if (!this._map) return 0;
+    const center = this._map.getCenter();
+    const latitudeRadians = (center.lat * Math.PI) / 180;
+    return (156543.03392 * Math.cos(latitudeRadians)) / 2 ** this._map.getZoom();
+  }
+
+  private async _centerMapOnEeObject(object: unknown, zoom?: number, onComplete?: () => void): Promise<void> {
+    if (!this._map) throw new Error('Control is not attached to a map.');
+    if (zoom !== undefined && !Number.isFinite(zoom)) throw new Error('Map.centerObject zoom must be numeric.');
+
+    const geometry = this._toEeGeometry(object);
+    const boundsObject =
+      geometry && typeof geometry === 'object' && 'bounds' in geometry && typeof geometry.bounds === 'function'
+        ? geometry.bounds()
+        : geometry;
+    const boundsInfo = await this._evaluateEeObject(boundsObject);
+    const bounds = this._boundsFromGeometryInfo(boundsInfo);
+    const center: [number, number] = [(bounds[0][0] + bounds[1][0]) / 2, (bounds[0][1] + bounds[1][1]) / 2];
+
+    if (zoom !== undefined || (bounds[0][0] === bounds[1][0] && bounds[0][1] === bounds[1][1])) {
+      this._map.jumpTo({ center, zoom: zoom ?? Math.max(this._map.getZoom(), 12) });
+    } else {
+      this._map.fitBounds(bounds, { padding: 32 });
+    }
+    onComplete?.();
+  }
+
+  private _toEeGeometry(object: unknown): unknown {
+    const candidate = object as { geometry?: () => unknown };
+    if (candidate && typeof candidate === 'object' && typeof candidate.geometry === 'function') {
+      return candidate.geometry();
+    }
+    return object;
+  }
+
+  private _boundsFromGeometryInfo(info: unknown): [[number, number], [number, number]] {
+    const coordinates = this._coordinatesFromGeometryInfo(info);
+    if (!coordinates.length) throw new Error('Unable to determine bounds for the Earth Engine object.');
+
+    const west = Math.min(...coordinates.map((coordinate) => coordinate[0]));
+    const south = Math.min(...coordinates.map((coordinate) => coordinate[1]));
+    const east = Math.max(...coordinates.map((coordinate) => coordinate[0]));
+    const north = Math.max(...coordinates.map((coordinate) => coordinate[1]));
+    return [
+      [west, south],
+      [east, north],
+    ];
+  }
+
+  private _coordinatesFromGeometryInfo(info: unknown): Array<[number, number]> {
+    if (Array.isArray(info)) {
+      if (info.length >= 2 && typeof info[0] === 'number' && typeof info[1] === 'number') {
+        return [[info[0], info[1]]];
+      }
+      return info.flatMap((item) => this._coordinatesFromGeometryInfo(item));
+    }
+
+    if (!info || typeof info !== 'object') return [];
+    const record = info as Record<string, unknown>;
+    return [
+      ...this._coordinatesFromGeometryInfo(record.coordinates),
+      ...this._coordinatesFromGeometryInfo(record.geometry),
+      ...this._coordinatesFromGeometryInfo(record.features),
+      ...this._coordinatesFromGeometryInfo(record.geometries),
+    ];
   }
 
   private _evaluateEeObject(input: unknown): Promise<unknown> {
@@ -955,6 +1237,7 @@ export class PluginControl implements IControl {
   }
 
   private _renderLayersList(): void {
+    this._renderInspectorLayerOptions();
     if (!this._layersListEl) return;
 
     if (!this._layers.length) {
@@ -1003,6 +1286,7 @@ export class PluginControl implements IControl {
         this.setState({ selectedAssetId: layer.assetId });
       }
       this._renderLayersList();
+      this._renderInspectorLayerOptions();
       this._setStatus(`Selected ${layer.name}`);
     });
 
@@ -1040,29 +1324,37 @@ export class PluginControl implements IControl {
   private _inspectorPanel(): HTMLElement {
     const el = this._panelShell('inspector', 'Inspect Earth Engine objects');
 
-    const objectScript = document.createElement('textarea');
-    objectScript.className = 'plugin-control-input plugin-code';
-    objectScript.value = "return ee.Image('USGS/SRTMGL1_003');";
+    const layerSelect = document.createElement('select');
+    layerSelect.className = 'plugin-control-input';
+    layerSelect.addEventListener('change', () => {
+      const layer = this._layers.find((item) => item.id === layerSelect.value);
+      if (!layer) return;
+      this._loadedLayer = layer;
+      this._renderLayersList();
+      this._setStatus(`Selected ${layer.name}`);
+    });
+    this._inspectorLayerSelect = layerSelect;
+    this._renderInspectorLayerOptions();
 
     const objectBtn = document.createElement('button');
     objectBtn.className = 'plugin-control-button';
     objectBtn.textContent = 'Inspect object';
     objectBtn.addEventListener('click', async () => {
       try {
+        const layer = this._selectedInspectorLayer();
         await this.authenticate();
-        this._setStatus('Inspecting Earth Engine object...');
-        const result = await this._evaluateEeObject(this._runEeScript(objectScript.value));
-        this._showInspectorResult(result);
-        this._setStatus('Object inspection complete.');
+        this._setStatus(`Inspecting ${layer.name}...`);
+        const result = await this._evaluateEeObject(layer.eeObject);
+        this._showInspectorResult({
+          layer: layer.name,
+          assetId: layer.assetId,
+          object: result,
+        });
+        this._setStatus(`Object inspection complete for ${layer.name}.`);
       } catch (error) {
         this._setStatus(`Object inspect failed: ${(error as Error).message}`);
       }
     });
-
-    const imageScript = document.createElement('textarea');
-    imageScript.className = 'plugin-control-input plugin-code';
-    imageScript.value = "return ee.Image('USGS/SRTMGL1_003');";
-    this._inspectorImageScript = imageScript;
 
     const lon = document.createElement('input');
     lon.className = 'plugin-control-input';
@@ -1087,7 +1379,7 @@ export class PluginControl implements IControl {
 
     const inspectPixel = document.createElement('button');
     inspectPixel.className = 'plugin-control-button';
-    inspectPixel.textContent = 'Inspect pixel';
+    inspectPixel.textContent = 'Inspect point';
     inspectPixel.addEventListener('click', async () => {
       await this._inspectPixelAt(Number(lon.value), Number(lat.value));
     });
@@ -1110,8 +1402,7 @@ export class PluginControl implements IControl {
     this._inspectorResultsEl.textContent = 'No inspection result.';
 
     [
-      { label: 'Object script', input: objectScript },
-      { label: 'Pixel image script', input: imageScript },
+      { label: 'Layer', input: layerSelect },
       { label: 'Longitude', input: lon },
       { label: 'Latitude', input: lat },
       { label: 'Scale', input: scale },
@@ -1127,6 +1418,46 @@ export class PluginControl implements IControl {
 
     el.append(objectBtn, inspectPixel, clickToggle, this._inspectorResultsEl);
     return el;
+  }
+
+  private _renderInspectorLayerOptions(): void {
+    if (!this._inspectorLayerSelect) return;
+
+    const currentId = this._inspectorLayerSelect.value || this._loadedLayer?.id;
+    this._inspectorLayerSelect.replaceChildren();
+
+    if (!this._layers.length) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = 'No Earth Engine layers added';
+      this._inspectorLayerSelect.appendChild(option);
+      this._inspectorLayerSelect.disabled = true;
+      return;
+    }
+
+    this._inspectorLayerSelect.disabled = false;
+    this._layers
+      .slice()
+      .reverse()
+      .forEach((layer) => {
+        const option = document.createElement('option');
+        option.value = layer.id;
+        option.textContent = layer.name;
+        this._inspectorLayerSelect?.appendChild(option);
+      });
+
+    const selected =
+      this._layers.find((layer) => layer.id === currentId) ??
+      this._loadedLayer ??
+      this._layers[this._layers.length - 1];
+    this._inspectorLayerSelect.value = selected.id;
+  }
+
+  private _selectedInspectorLayer(): LoadedLayerState {
+    const selectedId = this._inspectorLayerSelect?.value || this._loadedLayer?.id;
+    const layer = this._layers.find((item) => item.id === selectedId) ?? this._loadedLayer;
+    if (!layer) throw new Error('Add an Earth Engine layer before using the inspector.');
+    return layer;
   }
 
   private _enableInspector(): void {
@@ -1163,28 +1494,116 @@ export class PluginControl implements IControl {
       if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
         throw new Error('Enter valid longitude and latitude values.');
       }
+      const layer = this._selectedInspectorLayer();
       const scale = Number(this._inspectorScaleInput?.value || 30);
-      const image = this._runEeScript(this._inspectorImageScript?.value || "return ee.Image('USGS/SRTMGL1_003');") as {
-        reduceRegion: (params: Record<string, unknown>) => unknown;
-      };
-      if (typeof image.reduceRegion !== 'function') {
-        throw new Error('Pixel image script must return an ee.Image.');
-      }
 
       await this.authenticate();
-      this._setStatus('Inspecting pixel...');
+      this._setStatus(`Inspecting ${layer.name} at point...`);
+      const point = ee.Geometry.Point([lon, lat]);
+      const result = await this._inspectLayerAtPoint(layer, point, scale);
+      this._showInspectorResult({ layer: layer.name, lon, lat, ...result });
+      this._setStatus(`Point inspection complete for ${layer.name}.`);
+    } catch (error) {
+      this._setStatus(`Point inspect failed: ${(error as Error).message}`);
+    }
+  }
+
+  private async _inspectLayerAtPoint(
+    layer: LoadedLayerState,
+    point: object,
+    scale: number,
+  ): Promise<Record<string, unknown>> {
+    const image = this._imageObjectForPixelInspection(layer);
+    if (image) {
       const values = image.reduceRegion({
         reducer: ee.Reducer.first(),
-        geometry: ee.Geometry.Point([lon, lat]),
+        geometry: point,
         scale,
         maxPixels: 100000000,
       });
-      const result = await this._evaluateEeObject(values);
-      this._showInspectorResult({ lon, lat, scale, values: result });
-      this._setStatus('Pixel inspection complete.');
-    } catch (error) {
-      this._setStatus(`Pixel inspect failed: ${(error as Error).message}`);
+      return {
+        type: 'pixel',
+        scale,
+        values: await this._evaluateEeObject(values),
+      };
     }
+
+    const attributes = this._featureAttributesForPointInspection(layer, point);
+    if (attributes) {
+      return {
+        type: 'feature',
+        attributes: await this._evaluateEeObject(attributes),
+      };
+    }
+
+    throw new Error(`Layer "${layer.name}" is not inspectable at a point.`);
+  }
+
+  private _imageObjectForPixelInspection(layer: LoadedLayerState): {
+    reduceRegion: (params: Record<string, unknown>) => unknown;
+  } | undefined {
+    const input = layer.eeObject as {
+      reduceRegion?: (params: Record<string, unknown>) => unknown;
+      mosaic?: () => unknown;
+    };
+
+    if (typeof input.reduceRegion === 'function') {
+      return { reduceRegion: input.reduceRegion.bind(input) };
+    }
+
+    if (typeof input.mosaic === 'function') {
+      const mosaic = input.mosaic() as {
+        reduceRegion?: (params: Record<string, unknown>) => unknown;
+      };
+      if (typeof mosaic.reduceRegion === 'function') {
+        return { reduceRegion: mosaic.reduceRegion.bind(mosaic) };
+      }
+    }
+
+    return undefined;
+  }
+
+  private _featureAttributesForPointInspection(layer: LoadedLayerState, point: object): unknown {
+    const input = layer.eeObject as {
+      filterBounds?: (geometry: object) => unknown;
+    };
+
+    if (typeof input.filterBounds !== 'function') {
+      return undefined;
+    }
+
+    const filtered = input.filterBounds(point) as {
+      first?: () => unknown;
+      limit?: (count: number) => unknown;
+    };
+    const firstFeature =
+      typeof filtered?.first === 'function'
+        ? filtered.first()
+        : typeof filtered?.limit === 'function'
+          ? this._firstFeatureFromLimitedCollection(filtered.limit(1))
+          : undefined;
+    const feature = firstFeature as {
+      toDictionary?: () => unknown;
+      setGeometry?: (geometry: null) => { toDictionary?: () => unknown };
+    };
+
+    if (typeof feature?.toDictionary === 'function') {
+      return feature.toDictionary();
+    }
+
+    if (typeof feature?.setGeometry === 'function') {
+      const withoutGeometry = feature.setGeometry(null);
+      if (typeof withoutGeometry?.toDictionary === 'function') return withoutGeometry.toDictionary();
+    }
+
+    return undefined;
+  }
+
+  private _firstFeatureFromLimitedCollection(collection: unknown): unknown {
+    const featureCollection = collection as {
+      first?: () => unknown;
+    };
+    return typeof featureCollection?.first === 'function' ? featureCollection.first() : undefined;
   }
 
   private _showInspectorResult(result: unknown): void {
@@ -1197,7 +1616,20 @@ export class PluginControl implements IControl {
     const el = this._panelShell('code', 'Run Earth Engine script');
     const code = document.createElement('textarea');
     code.className = 'plugin-control-input plugin-code';
-    code.value = "return ee.Image('USGS/SRTMGL1_003');";
+    code.value = `// Load an image.
+var image = ee.Image('LANDSAT/LC08/C02/T1_TOA/LC08_044034_20140318');
+
+// Define the visualization parameters.
+var vizParams = {
+  bands: ['B5', 'B4', 'B3'],
+  min: 0,
+  max: 0.5,
+  gamma: [0.95, 1.1, 1]
+};
+
+// Center the map and display the image.
+Map.setCenter(-122.1899, 37.5010, 10);
+Map.addLayer(image, vizParams, 'false color composite');`;
 
     const btn = document.createElement('button');
     btn.className = 'plugin-control-button';
