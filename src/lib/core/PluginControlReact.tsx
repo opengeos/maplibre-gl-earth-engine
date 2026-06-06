@@ -10,7 +10,7 @@ import type { PluginControlReactProps } from './types';
  *
  * @example
  * ```tsx
- * import { PluginControlReact } from 'maplibre-gl-plugin-template/react';
+ * import { PluginControlReact } from 'maplibre-gl-earth-engine/react';
  *
  * function MyMap() {
  *   const [map, setMap] = useState<Map | null>(null);
