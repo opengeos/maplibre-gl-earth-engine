@@ -1,6 +1,6 @@
 .plugin-control-toggle { background:none; border:none; width:29px; height:29px; cursor:pointer; }
 .plugin-control-icon { font-size:18px; }
-.plugin-control-panel { position:absolute; top:40px; right:0; background:#fff; border-radius:8px; box-shadow:0 8px 30px rgba(0,0,0,.2); max-height:78vh; min-width:320px; min-height:320px; max-width:calc(100vw - 24px); overflow:hidden; display:none; flex-direction:column; z-index:1000; }
+.plugin-control-panel { position:absolute; top:40px; right:0; background:#fff; border-radius:8px; box-shadow:0 8px 30px rgba(0,0,0,.2); max-height:78vh; min-width:min(320px, calc(100vw - 24px)); min-height:320px; max-width:calc(100vw - 24px); overflow:hidden; display:none; flex-direction:column; z-index:1000; }
 .plugin-control-panel.expanded { display:flex; }
 .plugin-resize-handle { position:absolute; width:18px; height:18px; z-index:2; opacity:.55; }
 .plugin-resize-handle::after { content:""; position:absolute; inset:5px; border-right:2px solid #64748b; border-bottom:2px solid #64748b; }

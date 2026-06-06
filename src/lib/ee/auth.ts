@@ -87,7 +87,7 @@ async function ensureAuthenticated(options: EarthEngineAuthOptions): Promise<voi
   const token = ee.data?.getAuthToken?.();
   const currentAuthClientId = normalizeOptionalString(ee.data?.getAuthClientId?.());
   if (token) {
-    if (!oauthClientId || !currentAuthClientId || currentAuthClientId === oauthClientId) {
+    if (!oauthClientId || (currentAuthClientId && currentAuthClientId === oauthClientId)) {
       return;
     }
     ee.data?.clearAuthToken?.();
@@ -174,7 +174,11 @@ export async function authenticateWithOAuth(options: EarthEngineAuthOptions = {}
         ? `Authenticated with Google account (project: ${projectId}).`
         : 'Authenticated with Google account.',
     };
-  })().finally(() => {
+  })().catch((error) => {
+    initialized = false;
+    initializedProjectId = undefined;
+    throw error;
+  }).finally(() => {
     initializePromise = null;
   });
 

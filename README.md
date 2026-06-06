@@ -121,10 +121,11 @@ For static deployments (e.g., GitHub Pages):
 2. Configure a browser OAuth client ID if you want native Earth Engine login.
 
 For the included GitHub Pages workflow, add `VITE_GEE_OAUTH_CLIENT_ID` as a
-GitHub Actions variable on the `github-pages` environment. You can also add
-`VITE_GEE_PROJECT_ID` there as an optional default project ID. Vite embeds
-`VITE_*` variables into the deployed browser bundle, so use a public OAuth
-client ID, not a private key or secret.
+GitHub Actions secret on the `github-pages` environment. You can also add
+`VITE_GEE_PROJECT_ID` as a GitHub Actions variable there as an optional
+default project ID. Note that Vite embeds `VITE_*` values into the deployed
+browser bundle, so the client ID is still visible in the published site; use
+a public OAuth client ID, not a private key.
 
 ## Development
 

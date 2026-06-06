@@ -63,7 +63,8 @@ function firstString(...values: unknown[]): string | undefined {
 
 function truncate(text: string | undefined, length = 240): string | undefined {
   if (!text) return undefined;
-  return text.length > length ? `${text.slice(0, length - 1)}...` : text;
+  if (text.length <= length) return text;
+  return `${text.slice(0, Math.max(0, length - 3))}...`;
 }
 
 function inferCategory(id: string): string {

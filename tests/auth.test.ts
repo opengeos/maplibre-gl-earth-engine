@@ -16,6 +16,7 @@ const mockEe = vi.hoisted(() => ({
         _expiresIn: number,
         _extraScopes?: string[],
         callback?: () => void,
+        _updateAuthLibrary?: boolean,
       ) => callback?.(),
     ),
   },
