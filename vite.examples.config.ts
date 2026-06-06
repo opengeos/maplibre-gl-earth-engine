@@ -10,6 +10,7 @@ export default defineConfig({
   base: '/maplibre-gl-earth-engine/',
   build: {
     outDir: 'dist-examples',
+    minify: false,
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
