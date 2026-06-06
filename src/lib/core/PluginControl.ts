@@ -82,6 +82,8 @@ export class PluginControl implements IControl {
   private _projectId = '';
 
   private _loadAssetInput?: HTMLInputElement;
+  private _authProjectInput?: HTMLInputElement;
+  private _authOAuthClientInput?: HTMLInputElement;
   private _loadedLayer?: LoadedLayerState;
   private _layers: LoadedLayerState[] = [];
   private _layerCounter = 0;
@@ -185,9 +187,17 @@ export class PluginControl implements IControl {
     }
   }
 
-  async authenticate(projectId = this._projectId, oauthClientId = this._oauthClientId): Promise<void> {
-    this._projectId = projectId.trim();
-    this._oauthClientId = oauthClientId.trim();
+  private _activeProjectId(projectId?: string): string {
+    return (projectId ?? this._authProjectInput?.value ?? this._projectId).trim();
+  }
+
+  private _activeOAuthClientId(oauthClientId?: string): string {
+    return (oauthClientId ?? this._authOAuthClientInput?.value ?? this._oauthClientId).trim();
+  }
+
+  async authenticate(projectId?: string, oauthClientId?: string): Promise<void> {
+    this._projectId = this._activeProjectId(projectId);
+    this._oauthClientId = this._activeOAuthClientId(oauthClientId);
     this._storeProjectId(this._projectId);
     if (!this._oauthClientId && !this._options.accessToken) {
       throw new Error('Enter a Google OAuth client ID before signing in to Earth Engine.');
@@ -1213,6 +1223,7 @@ export class PluginControl implements IControl {
     oauthClient.placeholder = 'Google OAuth client ID';
     oauthClient.autocomplete = 'off';
     oauthClient.value = this._oauthClientId;
+    this._authOAuthClientInput = oauthClient;
     if (hasConfiguredOauthClient) {
       oauthClient.type = 'hidden';
     }
@@ -1222,6 +1233,7 @@ export class PluginControl implements IControl {
     project.placeholder = 'Google Cloud project ID';
     project.autocomplete = 'off';
     project.value = this._projectId;
+    this._authProjectInput = project;
     project.addEventListener('input', () => {
       this._projectId = project.value.trim();
       this._storeProjectId(this._projectId);
