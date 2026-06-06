@@ -679,14 +679,18 @@ export class PluginControl implements IControl {
 
   private _evaluateEeObject(input: unknown): Promise<unknown> {
     const obj = input as {
-      evaluate?: (success: (value: unknown) => void, failure?: (error: unknown) => void) => void;
+      evaluate?: (callback: (value: unknown, error?: unknown) => void) => void;
       getInfo?: (callback?: (value: unknown, error?: unknown) => void) => unknown;
       toString?: () => string;
     };
 
     if (typeof obj?.evaluate === 'function') {
+      // ee evaluate() invokes a single callback as callback(value, error).
       return new Promise((resolve, reject) => {
-        obj.evaluate?.(resolve, (error) => reject(error instanceof Error ? error : new Error(String(error))));
+        obj.evaluate?.((value, error) => {
+          if (error) reject(error instanceof Error ? error : new Error(String(error)));
+          else resolve(value);
+        });
       });
     }
 

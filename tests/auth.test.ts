@@ -31,6 +31,7 @@ import { authenticateWithOAuth } from '../src/lib/ee/auth';
 describe('authenticateWithOAuth', () => {
   beforeEach(() => {
     delete (globalThis as typeof globalThis & { ee?: unknown }).ee;
+    delete (mockEe as typeof mockEe & { Reducer?: unknown }).Reducer;
     mockEe.initialize.mockReset();
     mockEe.initialize.mockImplementation(
       (_baseUrl?: string | null, _tileUrl?: string | null, success?: () => void) => success?.(),
@@ -133,6 +134,49 @@ describe('authenticateWithOAuth', () => {
         force: true,
       }),
     ).rejects.toThrow('Earth Engine OAuth client ID is required.');
+  });
+
+  it('copies generated classes from an existing global ee namespace after initialization', async () => {
+    // The Earth Engine browser build attaches runtime-generated classes such as
+    // ee.Reducer to globalThis.ee during ee.initialize(). When globalThis.ee is
+    // already occupied by a different object, the imported module must still
+    // receive those classes.
+    const reducer = { first: vi.fn() };
+    const scope = globalThis as typeof globalThis & { ee?: Record<string, unknown> };
+    scope.ee = {};
+    mockEe.data.getAuthToken.mockReturnValue('Bearer existing-token');
+    mockEe.data.getAuthClientId.mockReturnValue('client-id');
+    mockEe.initialize.mockImplementation(
+      (_baseUrl?: string | null, _tileUrl?: string | null, success?: () => void) => {
+        // Simulate the library attaching generated classes to the global namespace.
+        scope.ee!.Reducer = reducer;
+        success?.();
+      },
+    );
+
+    await authenticateWithOAuth({
+      oauthClientId: 'client-id',
+      projectId: 'earth-engine-project',
+      force: true,
+    });
+
+    expect((mockEe as typeof mockEe & { Reducer?: unknown }).Reducer).toBe(reducer);
+  });
+
+  it('does not overwrite existing module members when syncing generated classes', async () => {
+    const scope = globalThis as typeof globalThis & { ee?: Record<string, unknown> };
+    scope.ee = { initialize: vi.fn(), data: {} };
+    mockEe.data.getAuthToken.mockReturnValue('Bearer existing-token');
+    mockEe.data.getAuthClientId.mockReturnValue('client-id');
+
+    await authenticateWithOAuth({
+      oauthClientId: 'client-id',
+      projectId: 'earth-engine-project',
+      force: true,
+    });
+
+    expect(mockEe.initialize).not.toBe(scope.ee.initialize);
+    expect(mockEe.data).not.toBe(scope.ee.data);
   });
 
   it('adds setup guidance to the Earth Engine Classifier initialization error', async () => {
