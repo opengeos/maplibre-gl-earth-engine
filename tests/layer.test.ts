@@ -32,4 +32,17 @@ describe('renderEeLayer', () => {
     expect(map.getLayer('lyr')).toBeTruthy();
     expect(obj.getMapId).toHaveBeenCalledTimes(2);
   });
+
+  it('rejects Earth Engine getMapId callback errors', async () => {
+    const map = createMapMock();
+    const obj = {
+      getMapId: vi.fn((_: unknown, cb: (m?: { urlFormat: string }, error?: string) => void) =>
+        cb(undefined, 'Permission denied'),
+      ),
+    };
+
+    await expect(renderEeLayer(map as never, obj, {}, 'src', 'lyr')).rejects.toThrow('Permission denied');
+    expect(map.getSource('src')).toBeFalsy();
+    expect(map.getLayer('lyr')).toBeFalsy();
+  });
 });
