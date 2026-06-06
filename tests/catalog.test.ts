@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { groupCatalogByCategory, queryCatalog, type CatalogItem } from '../src/lib/ee/catalog';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { fetchCatalogs, groupCatalogByCategory, queryCatalog, type CatalogItem } from '../src/lib/ee/catalog';
 
 const sample: CatalogItem[] = [
   {
@@ -31,6 +31,62 @@ const sample: CatalogItem[] = [
     category: 'users',
   },
 ];
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('fetchCatalogs', () => {
+  it('normalizes keyword strings, tag strings, snippets, categories, and links', async () => {
+    const responses = [
+      [
+        {
+          id: 'AAFC/ACI',
+          title: 'Canada AAFC Annual Crop Inventory',
+          type: 'image_collection',
+          snippet: "ee.ImageCollection('AAFC/ACI')",
+          provider: 'Agriculture and Agri-Food Canada',
+          category: 'agriculture',
+          keywords: 'aafc, agriculture, canada',
+          url: 'https://developers.google.com/earth-engine/datasets/catalog/AAFC_ACI',
+        },
+      ],
+      [
+        {
+          id: 'projects/sat-io/open-datasets/shoreline/mainlands',
+          title: 'Global Shoreline Dataset',
+          type: 'table',
+          provider: 'USGS',
+          tags: 'Global Shoreline, Shoreline, mainlands, Oceans',
+          thematic_group: 'Oceans and Shorelines',
+          docs: 'https://gee-community-catalog.org/projects/shoreline/',
+        },
+      ],
+    ];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((async () => {
+        const body = JSON.stringify(responses.shift());
+        return { text: async () => body };
+      }) as typeof fetch),
+    );
+
+    const result = await fetchCatalogs();
+    expect(result[0]).toMatchObject({
+      tags: ['aafc', 'agriculture', 'canada'],
+      snippet: "ee.ImageCollection('AAFC/ACI')",
+      category: 'agriculture',
+      url: 'https://developers.google.com/earth-engine/datasets/catalog/AAFC_ACI',
+    });
+    expect(result[1]).toMatchObject({
+      tags: ['Global Shoreline', 'Shoreline', 'mainlands', 'Oceans'],
+      snippet: 'https://gee-community-catalog.org/projects/shoreline/',
+      category: 'Oceans and Shorelines',
+      url: 'https://gee-community-catalog.org/projects/shoreline/',
+    });
+  });
+});
 
 describe('queryCatalog', () => {
   it('filters by keyword/source/type and sorts by title', () => {

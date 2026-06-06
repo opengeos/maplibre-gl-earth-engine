@@ -7,6 +7,7 @@ export interface CatalogItem {
   tags: string[];
   snippet?: string;
   category?: string;
+  url?: string;
 }
 
 export interface CatalogQuery {
@@ -35,6 +36,36 @@ function asArray(input: unknown): unknown[] {
   return Array.isArray(input) ? input : [];
 }
 
+function asString(input: unknown): string | undefined {
+  return typeof input === 'string' && input.trim() ? input.trim() : undefined;
+}
+
+function asStringList(input: unknown): string[] {
+  if (Array.isArray(input)) {
+    return input.map(String).map((item) => item.trim()).filter(Boolean);
+  }
+  if (typeof input === 'string') {
+    return input
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const text = asString(value);
+    if (text) return text;
+  }
+  return undefined;
+}
+
+function truncate(text: string | undefined, length = 240): string | undefined {
+  if (!text) return undefined;
+  return text.length > length ? `${text.slice(0, length - 1)}...` : text;
+}
+
 function inferCategory(id: string): string {
   const top = id.split('/')[0]?.trim();
   return top || 'Other';
@@ -44,7 +75,7 @@ function normalizeOfficial(record: Record<string, unknown>): CatalogItem | null 
   const id = String(record.id ?? record.asset_id ?? '').trim();
   if (!id) return null;
   const title = String(record.title ?? record.name ?? id);
-  const tags = asArray(record.tags).map(String);
+  const tags = asStringList(record.tags ?? record.keywords);
   return {
     id,
     title,
@@ -52,8 +83,9 @@ function normalizeOfficial(record: Record<string, unknown>): CatalogItem | null 
     type: record.type ? String(record.type) : undefined,
     source: 'official',
     tags,
-    snippet: record.description ? String(record.description).slice(0, 240) : undefined,
-    category: inferCategory(id),
+    snippet: truncate(firstString(record.description, record.summary, record.snippet)),
+    category: firstString(record.category) ?? inferCategory(id),
+    url: firstString(record.url, record.catalog, record.docs),
   };
 }
 
@@ -61,7 +93,7 @@ function normalizeCommunity(record: Record<string, unknown>): CatalogItem | null
   const id = String(record.id ?? record.asset_id ?? record.dataset_id ?? '').trim();
   if (!id) return null;
   const title = String(record.title ?? record.name ?? id);
-  const tags = asArray(record.tags).map(String);
+  const tags = asStringList(record.tags ?? record.keywords ?? record.thematic_group);
   return {
     id,
     title,
@@ -69,8 +101,9 @@ function normalizeCommunity(record: Record<string, unknown>): CatalogItem | null
     type: record.type ? String(record.type) : undefined,
     source: 'community',
     tags,
-    snippet: record.description ? String(record.description).slice(0, 240) : undefined,
-    category: inferCategory(id),
+    snippet: truncate(firstString(record.description, record.summary, record.snippet, record.docs, record.sample_code)),
+    category: firstString(record.category, record.thematic_group) ?? inferCategory(id),
+    url: firstString(record.url, record.docs, record.catalog, record.sample_code),
   };
 }
 
@@ -115,7 +148,7 @@ export function queryCatalog(items: CatalogItem[], query: CatalogQuery): Catalog
   const type = (query.type ?? 'all').toLowerCase();
   const sortBy = query.sortBy ?? 'title';
   const sortDir = query.sortDir ?? 'asc';
-  const pageSize = Math.max(1, query.limit ?? 25);
+  const pageSize = Math.max(1, query.limit ?? 100);
   const page = Math.max(1, query.page ?? 1);
 
   let filtered = filterCatalog(items, query.keyword ?? '');

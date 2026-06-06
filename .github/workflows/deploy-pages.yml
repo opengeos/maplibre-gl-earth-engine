@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   build:
+    environment: github-pages
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -35,9 +36,15 @@ jobs:
 
       - name: Build library
         run: npm run build
+        env:
+          VITE_GEE_OAUTH_CLIENT_ID: ${{ vars.VITE_GEE_OAUTH_CLIENT_ID }}
+          VITE_GEE_PROJECT_ID: ${{ vars.VITE_GEE_PROJECT_ID }}
 
       - name: Build examples for deployment
         run: npm run build:examples
+        env:
+          VITE_GEE_OAUTH_CLIENT_ID: ${{ vars.VITE_GEE_OAUTH_CLIENT_ID }}
+          VITE_GEE_PROJECT_ID: ${{ vars.VITE_GEE_PROJECT_ID }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -53,6 +60,9 @@ jobs:
     environment: github-pages
     runs-on: ubuntu-latest
     needs: build
+    env:
+      VITE_GEE_OAUTH_CLIENT_ID: ${{ vars.VITE_GEE_OAUTH_CLIENT_ID }}
+      VITE_GEE_PROJECT_ID: ${{ vars.VITE_GEE_PROJECT_ID }}
     steps:
       - name: Deploy to GitHub Pages
         id: deployment

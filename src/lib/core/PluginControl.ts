@@ -1,6 +1,6 @@
 import ee from '@google/earthengine';
 import type { IControl, Map as MapLibreMap } from 'maplibre-gl';
-import { authenticateWithServiceAccount } from '../ee/auth';
+import { authenticateWithOAuth } from '../ee/auth';
 import {
   fetchCatalogs,
   groupCatalogByCategory,
@@ -8,15 +8,7 @@ import {
   type CatalogItem,
   type CatalogQuery,
 } from '../ee/catalog';
-import { addTileUrlLayer, renderEeLayer, type VisualizeOptions } from '../ee/layer';
-import {
-  createEndpointClient,
-  normalizeEndpointUrl,
-  type EndpointClient,
-  type EndpointExportPayload,
-  type EndpointInspectPayload,
-  type EndpointTimeSeriesPayload,
-} from '../ee/endpoint';
+import { renderEeLayer, type VisualizeOptions } from '../ee/layer';
 import type {
   PluginControlOptions,
   PluginState,
@@ -25,6 +17,11 @@ import type {
   PluginStatus,
 } from './types';
 
+function buildEnvString(name: string): string {
+  const value = (import.meta as unknown as { env?: Record<string, unknown> }).env?.[name];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
 const DEFAULT_OPTIONS: Required<PluginControlOptions> = {
   collapsed: true,
   position: 'top-right',
@@ -32,32 +29,36 @@ const DEFAULT_OPTIONS: Required<PluginControlOptions> = {
   panelWidth: 420,
   maxHeight: '78vh',
   className: '',
+  storagePrefix: 'maplibre-gl-earth-engine',
+  oauthClientId: buildEnvString('VITE_GEE_OAUTH_CLIENT_ID'),
+  projectId: buildEnvString('VITE_GEE_PROJECT_ID'),
+  accessToken: '',
+  tokenType: 'Bearer',
+  tokenExpiresIn: 3600,
 };
 
 type EventHandlersMap = globalThis.Map<PluginControlEvent, Set<PluginControlEventHandler>>;
+type ControlPosition = Required<PluginControlOptions>['position'];
 
 interface LoadedLayerState {
+  id: string;
   sourceId: string;
   layerId: string;
-  assetId: string;
-}
-
-interface TimeFrame {
-  label: string;
-  startDate: string;
-  endDate: string;
-  tileUrl?: string;
+  name: string;
+  assetId?: string;
+  opacity: number;
+  visible: boolean;
+  addedAt: number;
+  tileUrl: string;
 }
 
 const TABS: Array<{ id: string; label: string }> = [
   { id: 'catalog', label: 'Browse/Catalog' },
   { id: 'search', label: 'Search' },
   { id: 'load', label: 'Load' },
-  { id: 'timeseries', label: 'Time Series' },
+  { id: 'layers', label: 'Layers' },
   { id: 'inspector', label: 'Inspector' },
   { id: 'code', label: 'Code' },
-  { id: 'export', label: 'Export' },
-  { id: 'settings', label: 'Settings' },
   { id: 'auth', label: 'Auth' },
 ];
 
@@ -72,33 +73,36 @@ export class PluginControl implements IControl {
   private _statusEl?: HTMLElement;
 
   private _catalog: CatalogItem[] = [];
+  private _catalogFetchPromise?: Promise<CatalogItem[]>;
+  private _catalogRefreshHandlers: Array<() => void> = [];
   private _selectedAssetId = 'USGS/SRTMGL1_003';
   private _selectedCatalogItem?: CatalogItem;
   private _activeTab = 'catalog';
-  private _tileEndpoint = 'https://huggingface.co/spaces/giswqs/ee-tile-request';
-  private _tileEndpointToken = '';
-  private _endpointClient?: EndpointClient;
+  private _oauthClientId = '';
+  private _projectId = '';
 
   private _loadAssetInput?: HTMLInputElement;
   private _loadedLayer?: LoadedLayerState;
-  private _mapClickHandler?: (e: { lngLat: { lng: number; lat: number } }) => void;
+  private _layers: LoadedLayerState[] = [];
+  private _layerCounter = 0;
+  private _layersListEl?: HTMLElement;
   private _inspectorActive = false;
+  private _inspectorClickHandler?: (e: { lngLat: { lng: number; lat: number } }) => void;
+  private _inspectorLonInput?: HTMLInputElement;
+  private _inspectorLatInput?: HTMLInputElement;
+  private _inspectorImageScript?: HTMLTextAreaElement;
+  private _inspectorScaleInput?: HTMLInputElement;
   private _inspectorResultsEl?: HTMLElement;
-  private _timeSeriesFrames: TimeFrame[] = [];
-  private _timeSeriesIndex = 0;
-  private _timeSeriesListEl?: HTMLElement;
+  private _previousMapCursor?: string;
   private _documentClickHandler?: (e: MouseEvent) => void;
   private _windowResizeHandler?: () => void;
   private _mapResizeHandler?: () => void;
+  private _resizeCleanup?: () => void;
 
   constructor(options?: Partial<PluginControlOptions>) {
     this._options = { ...DEFAULT_OPTIONS, ...options };
-    if (typeof window !== 'undefined') {
-      this._tileEndpoint = normalizeEndpointUrl(
-        window.localStorage.getItem('eeTileEndpoint') || this._tileEndpoint,
-      );
-      this._tileEndpointToken = window.localStorage.getItem('eeTileEndpointToken') || '';
-    }
+    this._oauthClientId = this._options.oauthClientId.trim();
+    this._projectId = this._initialProjectId();
     this._state = {
       collapsed: this._options.collapsed,
       panelWidth: this._options.panelWidth,
@@ -107,7 +111,6 @@ export class PluginControl implements IControl {
       selectedAssetId: this._selectedAssetId,
       authenticated: false,
     };
-    this._refreshEndpointClient();
   }
 
   onAdd(map: MapLibreMap): HTMLElement {
@@ -122,6 +125,7 @@ export class PluginControl implements IControl {
         if (!this._panel || !this._container?.parentElement) return;
         this._panel.classList.add('expanded');
         this._positionPanel();
+        this._handlePanelOpened();
       });
     }
     return this._container;
@@ -129,6 +133,7 @@ export class PluginControl implements IControl {
 
   onRemove(): void {
     this._disableInspector();
+    this._resizeCleanup?.();
     if (this._documentClickHandler) document.removeEventListener('click', this._documentClickHandler);
     if (this._windowResizeHandler) window.removeEventListener('resize', this._windowResizeHandler);
     if (this._mapResizeHandler) this._map?.off('resize', this._mapResizeHandler);
@@ -141,6 +146,10 @@ export class PluginControl implements IControl {
     this._eventHandlers.clear();
   }
 
+  getDefaultPosition(): ControlPosition {
+    return this._options.position;
+  }
+
   getState(): PluginState {
     return { ...this._state };
   }
@@ -150,9 +159,50 @@ export class PluginControl implements IControl {
     this._emit('statechange');
   }
 
-  async authenticate(projectId?: string): Promise<void> {
-    this._setStatus('Authenticating with EE service account…');
-    const result = await authenticateWithServiceAccount(projectId);
+  private _projectIdStorageKey(): string {
+    return `${this._options.storagePrefix}.earthEngine.projectId`;
+  }
+
+  private _initialProjectId(): string {
+    const configured = this._options.projectId.trim();
+    if (configured) return configured;
+    try {
+      return globalThis.sessionStorage?.getItem(this._projectIdStorageKey())?.trim() ?? '';
+    } catch {
+      return '';
+    }
+  }
+
+  private _storeProjectId(projectId: string): void {
+    try {
+      if (projectId) {
+        globalThis.sessionStorage?.setItem(this._projectIdStorageKey(), projectId);
+      } else {
+        globalThis.sessionStorage?.removeItem(this._projectIdStorageKey());
+      }
+    } catch {
+      // Ignore storage failures in private or restricted browser contexts.
+    }
+  }
+
+  async authenticate(projectId = this._projectId, oauthClientId = this._oauthClientId): Promise<void> {
+    this._projectId = projectId.trim();
+    this._oauthClientId = oauthClientId.trim();
+    this._storeProjectId(this._projectId);
+    if (!this._oauthClientId && !this._options.accessToken) {
+      throw new Error('Enter a Google OAuth client ID before signing in to Earth Engine.');
+    }
+    if (!this._projectId) {
+      throw new Error('Enter an Earth Engine-enabled Google Cloud project ID before signing in.');
+    }
+    this._setStatus('Authenticating with Google account...');
+    const result = await authenticateWithOAuth({
+      oauthClientId: this._oauthClientId || undefined,
+      projectId: this._projectId || undefined,
+      accessToken: this._options.accessToken || undefined,
+      tokenType: this._options.tokenType || undefined,
+      tokenExpiresIn: this._options.tokenExpiresIn,
+    });
     this.setState({ authenticated: result.ok });
     this._setStatus(result.message);
   }
@@ -160,17 +210,10 @@ export class PluginControl implements IControl {
   async loadAsset(assetId: string, vis: VisualizeOptions): Promise<void> {
     if (!this._map) throw new Error('Control is not attached to a map.');
     this._setStatus(`Rendering ${assetId}…`);
-    const sourceId = 'ee-source';
-    const layerId = 'ee-layer';
 
-    if (this._endpointClient) {
-      const tileUrl = await this._endpointClient.getTileUrl({ assetId, visParams: vis });
-      addTileUrlLayer(this._map, tileUrl, vis, sourceId, layerId);
-    } else {
-      await renderEeLayer(this._map, assetId, vis, sourceId, layerId);
-    }
+    await this.authenticate();
+    await this._renderManagedLayer(assetId, vis, { assetId, name: assetId });
 
-    this._loadedLayer = { sourceId, layerId, assetId };
     this._selectedAssetId = assetId;
     this.setState({ selectedAssetId: assetId });
     this._setStatus(`Loaded ${assetId}`);
@@ -180,26 +223,23 @@ export class PluginControl implements IControl {
     if (!this._map) throw new Error('Control is not attached to a map.');
     this._setStatus('Running script…');
 
-    if (this._endpointClient) {
-      const tileUrl = await this._endpointClient.getTileUrl({ script, visParams: vis });
-      addTileUrlLayer(this._map, tileUrl, vis);
-      this._setStatus('Script rendered successfully (endpoint).');
-      return;
-    }
-
     const fn = new Function('ee', `${script}`) as (eeNs: typeof ee) => unknown;
     const result = fn(ee);
     const target: string | object = typeof result === 'string' ? result : (result as object);
     if (!target) throw new Error('Script must return an asset ID string or an ee object.');
 
-    await renderEeLayer(this._map, target, vis);
+    await this.authenticate();
+    await this._renderManagedLayer(target, vis, { name: 'Script layer' });
     this._setStatus('Script rendered successfully.');
   }
 
   toggle(): void {
     this._state.collapsed = !this._state.collapsed;
     this._panel?.classList.toggle('expanded', !this._state.collapsed);
-    if (!this._state.collapsed) this._positionPanel();
+    if (!this._state.collapsed) {
+      this._positionPanel();
+      this._handlePanelOpened();
+    }
     this._emit(this._state.collapsed ? 'collapse' : 'expand');
     this._emit('statechange');
   }
@@ -231,16 +271,155 @@ export class PluginControl implements IControl {
     this._emit('statechange');
   }
 
-  private _refreshEndpointClient(): void {
-    if (!this._tileEndpoint.trim()) {
-      this._endpointClient = undefined;
+  private _handlePanelOpened(): void {
+    void this._ensureCatalogsFetched();
+  }
+
+  private async _ensureCatalogsFetched(): Promise<void> {
+    if (this._catalog.length) {
+      this._refreshCatalogViews();
       return;
     }
-    try {
-      this._endpointClient = createEndpointClient({ endpoint: this._tileEndpoint, token: this._tileEndpointToken || undefined });
-    } catch {
-      this._endpointClient = undefined;
+
+    if (!this._catalogFetchPromise) {
+      this._setStatus('Fetching catalog metadata...');
+      this._catalogFetchPromise = fetchCatalogs();
     }
+
+    try {
+      this._catalog = await this._catalogFetchPromise;
+      this._refreshCatalogViews();
+      this._setStatus(`Loaded ${this._catalog.length} datasets.`);
+    } catch (error) {
+      this._catalogFetchPromise = undefined;
+      this._setStatus(`Catalog fetch failed: ${(error as Error).message}`);
+    }
+  }
+
+  private _refreshCatalogViews(): void {
+    this._catalogRefreshHandlers.forEach((handler) => handler());
+  }
+
+  private _earthEngineDatasetUrl(assetId: string): string {
+    return `https://developers.google.com/earth-engine/datasets/catalog/${encodeURIComponent(
+      assetId.trim().replace(/\//g, '_'),
+    )}`;
+  }
+
+  private _catalogUrlForAsset(assetId: string): string {
+    const trimmed = assetId.trim();
+    const selected = this._selectedCatalogItem?.id === trimmed ? this._selectedCatalogItem : undefined;
+    const catalogItem = selected ?? this._catalog.find((item) => item.id === trimmed);
+    return catalogItem?.url ?? this._earthEngineDatasetUrl(trimmed);
+  }
+
+  private _nextLayerIds(): Pick<LoadedLayerState, 'id' | 'sourceId' | 'layerId'> {
+    this._layerCounter += 1;
+    const id = `ee-${Date.now().toString(36)}-${this._layerCounter}`;
+    return {
+      id,
+      sourceId: `${id}-source`,
+      layerId: `${id}-layer`,
+    };
+  }
+
+  private async _renderManagedLayer(
+    input: string | object,
+    vis: VisualizeOptions,
+    meta: { name: string; assetId?: string },
+    existing?: LoadedLayerState,
+  ): Promise<LoadedLayerState> {
+    if (!this._map) throw new Error('Control is not attached to a map.');
+    const ids = existing ?? this._nextLayerIds();
+    const result = await renderEeLayer(this._map, input, vis, ids.sourceId, ids.layerId);
+    const layerState: LoadedLayerState = {
+      id: ids.id,
+      sourceId: result.sourceId,
+      layerId: result.layerId,
+      name: meta.name,
+      assetId: meta.assetId,
+      opacity: vis.opacity ?? existing?.opacity ?? 1,
+      visible: existing?.visible ?? true,
+      addedAt: existing?.addedAt ?? Date.now(),
+      tileUrl: result.tileUrl,
+    };
+
+    const index = this._layers.findIndex((layer) => layer.id === layerState.id);
+    if (index >= 0) {
+      this._layers[index] = layerState;
+    } else {
+      this._layers.push(layerState);
+    }
+    this._loadedLayer = layerState;
+    this._applyLayerVisibility(layerState);
+    this._applyLayerOpacity(layerState);
+    this._renderLayersList();
+    return layerState;
+  }
+
+  private _removeManagedLayer(layerId: string): void {
+    if (!this._map) return;
+    const layer = this._layers.find((item) => item.id === layerId);
+    if (!layer) return;
+    if (this._map.getLayer(layer.layerId)) this._map.removeLayer(layer.layerId);
+    if (this._map.getSource(layer.sourceId)) this._map.removeSource(layer.sourceId);
+    this._layers = this._layers.filter((item) => item.id !== layerId);
+    if (this._loadedLayer?.id === layerId) this._loadedLayer = this._layers[this._layers.length - 1];
+    this._renderLayersList();
+  }
+
+  private _applyLayerOpacity(layer: LoadedLayerState): void {
+    if (!this._map?.getLayer(layer.layerId)) return;
+    this._map.setPaintProperty(layer.layerId, 'raster-opacity', layer.opacity);
+  }
+
+  private _applyLayerVisibility(layer: LoadedLayerState): void {
+    if (!this._map?.getLayer(layer.layerId)) return;
+    this._map.setLayoutProperty(layer.layerId, 'visibility', layer.visible ? 'visible' : 'none');
+  }
+
+  private _runEeScript(script: string): unknown {
+    const fn = new Function('ee', `${script}`) as (eeNs: typeof ee) => unknown;
+    const result = fn(ee);
+    if (!result) throw new Error('Script must return an Earth Engine object.');
+    return result;
+  }
+
+  private _evaluateEeObject(input: unknown): Promise<unknown> {
+    const obj = input as {
+      evaluate?: (success: (value: unknown) => void, failure?: (error: unknown) => void) => void;
+      getInfo?: (callback?: (value: unknown, error?: unknown) => void) => unknown;
+      toString?: () => string;
+    };
+
+    if (typeof obj?.evaluate === 'function') {
+      return new Promise((resolve, reject) => {
+        obj.evaluate?.(resolve, (error) => reject(error instanceof Error ? error : new Error(String(error))));
+      });
+    }
+
+    if (typeof obj?.getInfo === 'function') {
+      return new Promise((resolve, reject) => {
+        try {
+          if (obj.getInfo?.length) {
+            obj.getInfo((value, error) => {
+              if (error) reject(error instanceof Error ? error : new Error(String(error)));
+              else resolve(value);
+            });
+          } else {
+            resolve(obj.getInfo?.());
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
+    }
+
+    if (typeof obj?.toString === 'function') {
+      return Promise.resolve(obj.toString());
+    }
+
+    return Promise.resolve(input);
   }
 
   private _createContainer(): HTMLElement {
@@ -262,9 +441,7 @@ export class PluginControl implements IControl {
     panel.className = 'plugin-control-panel';
     panel.style.width = `${this._options.panelWidth}px`;
     panel.style.maxHeight =
-      typeof this._options.maxHeight === 'number'
-        ? `${this._options.maxHeight}px`
-        : this._options.maxHeight;
+      typeof this._options.maxHeight === 'number' ? `${this._options.maxHeight}px` : this._options.maxHeight;
 
     const header = document.createElement('div');
     header.className = 'plugin-control-header';
@@ -286,8 +463,87 @@ export class PluginControl implements IControl {
     status.textContent = this._state.status;
     this._statusEl = status;
 
-    panel.append(header, tabs, body, status);
+    const resizeHandle = document.createElement('div');
+    resizeHandle.className = this._resizeHandleClassName();
+    resizeHandle.addEventListener('pointerdown', (event) => this._startPanelResize(event));
+
+    panel.append(header, tabs, body, status, resizeHandle);
     return panel;
+  }
+
+  private _resizeHandleClassName(): string {
+    const position = this._actualControlPosition();
+    const horizontal = position.endsWith('right') ? 'left' : 'right';
+    const vertical = position.startsWith('bottom') ? 'top' : 'bottom';
+    return `plugin-resize-handle plugin-resize-${horizontal} plugin-resize-${vertical}`;
+  }
+
+  private _actualControlPosition(): ControlPosition {
+    const parent = this._container?.parentElement;
+    if (parent?.classList.contains('maplibregl-ctrl-top-left')) return 'top-left';
+    if (parent?.classList.contains('maplibregl-ctrl-top-right')) return 'top-right';
+    if (parent?.classList.contains('maplibregl-ctrl-bottom-left')) return 'bottom-left';
+    if (parent?.classList.contains('maplibregl-ctrl-bottom-right')) return 'bottom-right';
+    return this._options.position;
+  }
+
+  private _updateResizeHandlePlacement(): void {
+    const resizeHandle = this._panel?.querySelector('.plugin-resize-handle');
+    if (resizeHandle) resizeHandle.className = this._resizeHandleClassName();
+  }
+
+  private _startPanelResize(event: PointerEvent): void {
+    if (!this._panel || !this._mapContainer) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    this._resizeCleanup?.();
+
+    const position = this._actualControlPosition();
+    const rightAnchored = position.endsWith('right');
+    const bottomAnchored = position.startsWith('bottom');
+    const mapRect = this._mapContainer.getBoundingClientRect();
+    const panelRect = this._panel.getBoundingClientRect();
+    const startLeft = panelRect.left - mapRect.left;
+    const startTop = panelRect.top - mapRect.top;
+    const startWidth = panelRect.width;
+    const startHeight = panelRect.height;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const edgeMargin = 12;
+    const minWidth = 320;
+    const minHeight = 320;
+    const maxWidth = rightAnchored ? startLeft + startWidth - edgeMargin : mapRect.width - startLeft - edgeMargin;
+    const maxHeight = bottomAnchored ? startTop + startHeight - edgeMargin : mapRect.height - startTop - edgeMargin;
+
+    const clampSize = (value: number, min: number, max: number): number => Math.min(Math.max(value, min), max);
+
+    const onMove = (moveEvent: PointerEvent): void => {
+      if (!this._panel) return;
+      const dx = moveEvent.clientX - startX;
+      const dy = moveEvent.clientY - startY;
+      const width = clampSize(rightAnchored ? startWidth - dx : startWidth + dx, minWidth, maxWidth);
+      const height = clampSize(bottomAnchored ? startHeight - dy : startHeight + dy, minHeight, maxHeight);
+      const left = rightAnchored ? startLeft + startWidth - width : startLeft;
+      const top = bottomAnchored ? startTop + startHeight - height : startTop;
+
+      this._panel.style.width = `${Math.round(width)}px`;
+      this._panel.style.height = `${Math.round(height)}px`;
+      this._panel.style.left = `${Math.round(left)}px`;
+      this._panel.style.top = `${Math.round(top)}px`;
+    };
+
+    const onUp = (): void => {
+      this._resizeCleanup?.();
+      this._resizeCleanup = undefined;
+    };
+
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp, { once: true });
+    this._resizeCleanup = () => {
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+    };
   }
 
   private _createTabs(): HTMLElement {
@@ -324,11 +580,9 @@ export class PluginControl implements IControl {
       this._catalogPanel(),
       this._searchPanel(),
       this._loadPanel(),
-      this._timeSeriesPanel(),
+      this._layersPanel(),
       this._inspectorPanel(),
       this._codePanel(),
-      this._exportPanel(),
-      this._settingsPanel(),
       this._authPanel(),
     ];
   }
@@ -349,7 +603,8 @@ export class PluginControl implements IControl {
 
     const sourceSelect = document.createElement('select');
     sourceSelect.className = 'plugin-control-input';
-    sourceSelect.innerHTML = '<option value="all">All sources</option><option value="official">Official</option><option value="community">Community</option>';
+    sourceSelect.innerHTML =
+      '<option value="all">All sources</option><option value="official">Official</option><option value="community">Community</option>';
 
     const fetchBtn = document.createElement('button');
     fetchBtn.className = 'plugin-control-button';
@@ -361,13 +616,19 @@ export class PluginControl implements IControl {
     categoryList.className = 'plugin-list';
     const details = document.createElement('div');
     details.className = 'plugin-detail';
+    const openDatasetBtn = document.createElement('button');
+    openDatasetBtn.className = 'plugin-control-button plugin-control-button-muted';
+    openDatasetBtn.textContent = 'Open dataset page';
+    openDatasetBtn.disabled = true;
 
     const renderDetails = (item?: CatalogItem): void => {
       if (!item) {
         details.textContent = 'Select a dataset to see details.';
+        openDatasetBtn.disabled = true;
         return;
       }
       this._selectedCatalogItem = item;
+      openDatasetBtn.disabled = false;
       details.innerHTML = `
         <div><strong>${item.title}</strong></div>
         <div>ID: ${item.id}</div>
@@ -389,10 +650,24 @@ export class PluginControl implements IControl {
       this._switchTab('load');
       this._setStatus(`Populated Load tab with ${this._selectedCatalogItem.id}`);
     });
+    openDatasetBtn.addEventListener('click', () => {
+      if (!this._selectedCatalogItem) return;
+      window.open(
+        this._selectedCatalogItem.url ?? this._earthEngineDatasetUrl(this._selectedCatalogItem.id),
+        '_blank',
+        'noopener,noreferrer',
+      );
+    });
 
     const renderCatalog = (): void => {
       const source = sourceSelect.value as CatalogQuery['source'];
-      const filtered = queryCatalog(this._catalog, { source, sortBy: 'title', sortDir: 'asc', limit: 1000, page: 1 });
+      const filtered = queryCatalog(this._catalog, {
+        source,
+        sortBy: 'title',
+        sortDir: 'asc',
+        limit: 1000,
+        page: 1,
+      });
       count.textContent = `Result count: ${filtered.total}`;
 
       const grouped = groupCatalogByCategory(filtered.items);
@@ -423,17 +698,13 @@ export class PluginControl implements IControl {
 
     sourceSelect.addEventListener('change', renderCatalog);
     fetchBtn.addEventListener('click', async () => {
-      try {
-        this._setStatus('Fetching catalog metadata…');
-        this._catalog = await fetchCatalogs();
-        renderCatalog();
-        this._setStatus(`Loaded ${this._catalog.length} datasets.`);
-      } catch (error) {
-        this._setStatus(`Catalog fetch failed: ${(error as Error).message}`);
-      }
+      this._catalog = [];
+      this._catalogFetchPromise = undefined;
+      await this._ensureCatalogsFetched();
     });
 
-    el.append(sourceSelect, fetchBtn, count, categoryList, details, populateLoadBtn);
+    el.append(sourceSelect, fetchBtn, count, categoryList, details, populateLoadBtn, openDatasetBtn);
+    this._catalogRefreshHandlers.push(renderCatalog);
     renderDetails();
     return el;
   }
@@ -446,7 +717,8 @@ export class PluginControl implements IControl {
 
     const source = document.createElement('select');
     source.className = 'plugin-control-input';
-    source.innerHTML = '<option value="all">All sources</option><option value="official">Official</option><option value="community">Community</option>';
+    source.innerHTML =
+      '<option value="all">All sources</option><option value="official">Official</option><option value="community">Community</option>';
 
     const type = document.createElement('input');
     type.className = 'plugin-control-input';
@@ -461,7 +733,7 @@ export class PluginControl implements IControl {
     limit.type = 'number';
     limit.min = '1';
     limit.max = '200';
-    limit.value = '25';
+    limit.value = '100';
 
     const page = document.createElement('input');
     page.className = 'plugin-control-input';
@@ -481,7 +753,7 @@ export class PluginControl implements IControl {
         type: type.value.trim() || 'all',
         sortBy: sort.value as CatalogQuery['sortBy'],
         sortDir: 'asc',
-        limit: Number(limit.value) || 25,
+        limit: Number(limit.value) || 100,
         page: Number(page.value) || 1,
       };
       const result = queryCatalog(this._catalog, q);
@@ -494,9 +766,11 @@ export class PluginControl implements IControl {
           btn.textContent = `${item.title} (${item.id})`;
           btn.addEventListener('click', () => {
             this._selectedAssetId = item.id;
+            this._selectedCatalogItem = item;
             if (this._loadAssetInput) this._loadAssetInput.value = item.id;
             this.setState({ selectedAssetId: item.id });
             this._setStatus(`Selected ${item.id}`);
+            this._switchTab('load');
           });
           return btn;
         }),
@@ -506,6 +780,7 @@ export class PluginControl implements IControl {
     [keyword, source, type, sort, limit, page].forEach((input) => input.addEventListener('input', render));
 
     el.append(keyword, source, type, sort, limit, page, count, list);
+    this._catalogRefreshHandlers.push(render);
     return el;
   }
 
@@ -535,7 +810,8 @@ export class PluginControl implements IControl {
 
     const reducer = document.createElement('select');
     reducer.className = 'plugin-control-input';
-    reducer.innerHTML = '<option value="median">median</option><option value="mean">mean</option><option value="max">max</option><option value="min">min</option>';
+    reducer.innerHTML =
+      '<option value="median">median</option><option value="mean">mean</option><option value="max">max</option><option value="min">min</option>';
 
     const bands = document.createElement('input');
     bands.className = 'plugin-control-input';
@@ -592,7 +868,12 @@ export class PluginControl implements IControl {
         return;
       }
       try {
-        await this.loadAsset(asset.value.trim(), toVis());
+        const assetId = asset.value.trim();
+        await this.authenticate();
+        await this._renderManagedLayer(assetId, toVis(), { assetId, name: assetId }, this._loadedLayer);
+        this._selectedAssetId = assetId;
+        this.setState({ selectedAssetId: assetId });
+        this._setStatus(`Updated ${assetId}`);
       } catch (error) {
         this._setStatus(`Update failed: ${(error as Error).message}`);
       }
@@ -602,18 +883,31 @@ export class PluginControl implements IControl {
     removeBtn.className = 'plugin-control-button plugin-control-button-danger';
     removeBtn.textContent = 'Remove layer';
     removeBtn.addEventListener('click', () => {
-      if (!this._map || !this._loadedLayer) return;
-      if (this._map.getLayer(this._loadedLayer.layerId)) this._map.removeLayer(this._loadedLayer.layerId);
-      if (this._map.getSource(this._loadedLayer.sourceId)) this._map.removeSource(this._loadedLayer.sourceId);
-      this._loadedLayer = undefined;
+      if (!this._loadedLayer) return;
+      this._removeManagedLayer(this._loadedLayer.id);
       this._setStatus('Layer removed.');
+    });
+
+    const openDatasetBtn = document.createElement('button');
+    openDatasetBtn.className = 'plugin-control-button plugin-control-button-muted';
+    openDatasetBtn.textContent = 'Open dataset page';
+    openDatasetBtn.addEventListener('click', () => {
+      const assetId = asset.value.trim();
+      if (!assetId) {
+        this._setStatus('Enter an asset ID before opening the dataset page.');
+        return;
+      }
+      window.open(this._catalogUrlForAsset(assetId), '_blank', 'noopener,noreferrer');
     });
 
     const optionsNote = document.createElement('p');
     optionsNote.className = 'plugin-control-placeholder';
     optionsNote.textContent = `Collection options: ${dateStart.value || 'start?'} to ${dateEnd.value || 'end?'}, cloud ${cloudProp.value || 'property'} <= ${cloudThreshold.value}, reducer ${reducer.value}`;
 
-    const fields: Array<{ label: string; input: HTMLInputElement | HTMLSelectElement }> = [
+    const fields: Array<{
+      label: string;
+      input: HTMLInputElement | HTMLSelectElement;
+    }> = [
       { label: 'Asset ID', input: asset },
       { label: 'Date start', input: dateStart },
       { label: 'Date end', input: dateEnd },
@@ -637,106 +931,180 @@ export class PluginControl implements IControl {
       el.appendChild(group);
     });
 
-    el.append(addBtn, updateBtn, removeBtn, optionsNote);
+    el.append(addBtn, updateBtn, removeBtn, openDatasetBtn, optionsNote);
     return el;
   }
 
-  private _timeSeriesPanel(): HTMLElement {
-    const el = this._panelShell('timeseries', 'Time series (MVP)');
+  private _layersPanel(): HTMLElement {
+    const el = this._panelShell('layers', 'Earth Engine layers');
+    this._layersListEl = document.createElement('div');
+    this._layersListEl.className = 'plugin-layer-list';
+    this._renderLayersList();
+    el.appendChild(this._layersListEl);
+    return el;
+  }
 
-    const assetId = document.createElement('input');
-    assetId.className = 'plugin-control-input';
-    assetId.value = this._selectedAssetId;
+  private _renderLayersList(): void {
+    if (!this._layersListEl) return;
 
-    const start = document.createElement('input');
-    start.className = 'plugin-control-input';
-    start.type = 'date';
+    if (!this._layers.length) {
+      const empty = document.createElement('div');
+      empty.className = 'plugin-control-placeholder';
+      empty.textContent = 'No Earth Engine layers added.';
+      this._layersListEl.replaceChildren(empty);
+      return;
+    }
 
-    const end = document.createElement('input');
-    end.className = 'plugin-control-input';
-    end.type = 'date';
+    this._layersListEl.replaceChildren(
+      ...this._layers
+        .slice()
+        .reverse()
+        .map((layer) => this._layerListItem(layer)),
+    );
+  }
 
-    const frequency = document.createElement('select');
-    frequency.className = 'plugin-control-input';
-    frequency.innerHTML = '<option value="month">month</option><option value="week">week</option><option value="day">day</option><option value="year">year</option>';
+  private _layerListItem(layer: LoadedLayerState): HTMLElement {
+    const item = document.createElement('div');
+    item.className = `plugin-layer-item ${this._loadedLayer?.id === layer.id ? 'active' : ''}`;
 
-    const reducer = document.createElement('select');
-    reducer.className = 'plugin-control-input';
-    reducer.innerHTML = '<option value="median">median</option><option value="mean">mean</option><option value="max">max</option><option value="min">min</option>';
+    const row = document.createElement('div');
+    row.className = 'plugin-layer-row';
 
-    const descriptor = document.createElement('pre');
-    descriptor.className = 'plugin-control-placeholder';
-    this._timeSeriesListEl = document.createElement('div');
-    this._timeSeriesListEl.className = 'plugin-list';
-
-    const renderFrames = (): void => {
-      if (!this._timeSeriesListEl) return;
-      this._timeSeriesListEl.replaceChildren(
-        ...this._timeSeriesFrames.map((frame, idx) => {
-          const btn = document.createElement('button');
-          btn.className = `plugin-list-item ${idx === this._timeSeriesIndex ? 'active' : ''}`;
-          btn.type = 'button';
-          btn.textContent = `${frame.label}: ${frame.startDate} → ${frame.endDate}`;
-          btn.addEventListener('click', async () => {
-            this._timeSeriesIndex = idx;
-            await this._loadTimeSeriesFrame(assetId.value, frame, reducer.value);
-            renderFrames();
-          });
-          return btn;
-        }),
-      );
-    };
-
-    const buildFrames = (): void => {
-      const startDate = start.value;
-      const endDate = end.value;
-      if (!startDate || !endDate) return;
-      const steps = 6;
-      this._timeSeriesFrames = Array.from({ length: steps }).map((_, i) => ({
-        label: `Frame ${i + 1}`,
-        startDate,
-        endDate,
-      }));
-      this._timeSeriesIndex = 0;
-      descriptor.textContent = JSON.stringify(
-        { assetId: assetId.value, startDate, endDate, frequency: frequency.value, reducer: reducer.value, steps },
-        null,
-        2,
-      );
-      renderFrames();
-    };
-
-    const generateBtn = document.createElement('button');
-    generateBtn.className = 'plugin-control-button';
-    generateBtn.textContent = 'Generate sequence';
-    generateBtn.addEventListener('click', buildFrames);
-
-    const prevBtn = document.createElement('button');
-    prevBtn.className = 'plugin-control-button plugin-control-button-muted';
-    prevBtn.textContent = 'Prev frame';
-    prevBtn.addEventListener('click', async () => {
-      if (!this._timeSeriesFrames.length) return;
-      this._timeSeriesIndex = Math.max(0, this._timeSeriesIndex - 1);
-      await this._loadTimeSeriesFrame(assetId.value, this._timeSeriesFrames[this._timeSeriesIndex], reducer.value);
-      renderFrames();
+    const visibility = document.createElement('input');
+    visibility.className = 'plugin-layer-checkbox';
+    visibility.type = 'checkbox';
+    visibility.checked = layer.visible;
+    visibility.title = 'Toggle visibility';
+    visibility.addEventListener('change', () => {
+      layer.visible = visibility.checked;
+      this._applyLayerVisibility(layer);
+      this._setStatus(`${layer.visible ? 'Shown' : 'Hidden'} ${layer.name}`);
     });
 
-    const nextBtn = document.createElement('button');
-    nextBtn.className = 'plugin-control-button plugin-control-button-muted';
-    nextBtn.textContent = 'Next frame';
-    nextBtn.addEventListener('click', async () => {
-      if (!this._timeSeriesFrames.length) return;
-      this._timeSeriesIndex = Math.min(this._timeSeriesFrames.length - 1, this._timeSeriesIndex + 1);
-      await this._loadTimeSeriesFrame(assetId.value, this._timeSeriesFrames[this._timeSeriesIndex], reducer.value);
-      renderFrames();
+    const title = document.createElement('button');
+    title.className = 'plugin-layer-title';
+    title.type = 'button';
+    title.textContent = layer.name;
+    title.addEventListener('click', () => {
+      this._loadedLayer = layer;
+      if (layer.assetId) {
+        this._selectedAssetId = layer.assetId;
+        if (this._loadAssetInput) this._loadAssetInput.value = layer.assetId;
+        this.setState({ selectedAssetId: layer.assetId });
+      }
+      this._renderLayersList();
+      this._setStatus(`Selected ${layer.name}`);
     });
+
+    const opacity = document.createElement('input');
+    opacity.className = 'plugin-layer-opacity';
+    opacity.type = 'range';
+    opacity.min = '0';
+    opacity.max = '1';
+    opacity.step = '0.05';
+    opacity.value = String(layer.opacity);
+    opacity.title = 'Opacity';
+    opacity.addEventListener('input', () => {
+      layer.opacity = Number(opacity.value);
+      this._applyLayerOpacity(layer);
+    });
+    opacity.addEventListener('change', () => {
+      this._setStatus(`Updated opacity for ${layer.name}`);
+    });
+
+    const remove = document.createElement('button');
+    remove.className = 'plugin-layer-icon-button';
+    remove.type = 'button';
+    remove.textContent = 'x';
+    remove.title = 'Remove layer';
+    remove.addEventListener('click', () => {
+      this._removeManagedLayer(layer.id);
+      this._setStatus(`Removed ${layer.name}`);
+    });
+
+    row.append(visibility, title, opacity, remove);
+    item.append(row);
+    return item;
+  }
+
+  private _inspectorPanel(): HTMLElement {
+    const el = this._panelShell('inspector', 'Inspect Earth Engine objects');
+
+    const objectScript = document.createElement('textarea');
+    objectScript.className = 'plugin-control-input plugin-code';
+    objectScript.value = "return ee.Image('USGS/SRTMGL1_003');";
+
+    const objectBtn = document.createElement('button');
+    objectBtn.className = 'plugin-control-button';
+    objectBtn.textContent = 'Inspect object';
+    objectBtn.addEventListener('click', async () => {
+      try {
+        await this.authenticate();
+        this._setStatus('Inspecting Earth Engine object...');
+        const result = await this._evaluateEeObject(this._runEeScript(objectScript.value));
+        this._showInspectorResult(result);
+        this._setStatus('Object inspection complete.');
+      } catch (error) {
+        this._setStatus(`Object inspect failed: ${(error as Error).message}`);
+      }
+    });
+
+    const imageScript = document.createElement('textarea');
+    imageScript.className = 'plugin-control-input plugin-code';
+    imageScript.value = "return ee.Image('USGS/SRTMGL1_003');";
+    this._inspectorImageScript = imageScript;
+
+    const lon = document.createElement('input');
+    lon.className = 'plugin-control-input';
+    lon.type = 'number';
+    lon.step = 'any';
+    lon.value = '-122.292';
+    this._inspectorLonInput = lon;
+
+    const lat = document.createElement('input');
+    lat.className = 'plugin-control-input';
+    lat.type = 'number';
+    lat.step = 'any';
+    lat.value = '37.901';
+    this._inspectorLatInput = lat;
+
+    const scale = document.createElement('input');
+    scale.className = 'plugin-control-input';
+    scale.type = 'number';
+    scale.min = '1';
+    scale.value = '30';
+    this._inspectorScaleInput = scale;
+
+    const inspectPixel = document.createElement('button');
+    inspectPixel.className = 'plugin-control-button';
+    inspectPixel.textContent = 'Inspect pixel';
+    inspectPixel.addEventListener('click', async () => {
+      await this._inspectPixelAt(Number(lon.value), Number(lat.value));
+    });
+
+    const clickToggle = document.createElement('button');
+    clickToggle.className = 'plugin-control-button plugin-control-button-muted';
+    clickToggle.textContent = 'Enable map click';
+    clickToggle.addEventListener('click', () => {
+      if (this._inspectorActive) {
+        this._disableInspector();
+        clickToggle.textContent = 'Enable map click';
+      } else {
+        this._enableInspector();
+        clickToggle.textContent = 'Disable map click';
+      }
+    });
+
+    this._inspectorResultsEl = document.createElement('pre');
+    this._inspectorResultsEl.className = 'plugin-control-placeholder plugin-inspector-output';
+    this._inspectorResultsEl.textContent = 'No inspection result.';
 
     [
-      { label: 'Asset ID', input: assetId },
-      { label: 'Start date', input: start },
-      { label: 'End date', input: end },
-      { label: 'Frequency', input: frequency },
-      { label: 'Reducer', input: reducer },
+      { label: 'Object script', input: objectScript },
+      { label: 'Pixel image script', input: imageScript },
+      { label: 'Longitude', input: lon },
+      { label: 'Latitude', input: lat },
+      { label: 'Scale', input: scale },
     ].forEach(({ label, input }) => {
       const group = document.createElement('div');
       group.className = 'plugin-control-group';
@@ -747,109 +1115,72 @@ export class PluginControl implements IControl {
       el.appendChild(group);
     });
 
-    el.append(generateBtn, prevBtn, nextBtn, descriptor, this._timeSeriesListEl);
-    return el;
-  }
-
-  private async _loadTimeSeriesFrame(assetId: string, frame: TimeFrame, reducer: string): Promise<void> {
-    if (!this._map) return;
-    if (!this._endpointClient) {
-      this._setStatus('Time series requires endpoint mode.');
-      return;
-    }
-    try {
-      const payload: EndpointTimeSeriesPayload = {
-        assetId,
-        startDate: frame.startDate,
-        endDate: frame.endDate,
-        frequency: 'month',
-        reducer,
-      };
-      const tsResponse = await this._endpointClient.requestTimeSeries(payload).catch(() => ({ notImplemented: true }));
-      if (tsResponse.notImplemented) {
-        this._setStatus('Time series endpoint not implemented; showing frame requests only.');
-      }
-      const tileUrl = await this._endpointClient.getTileUrl({
-        assetId,
-        dateRange: { start: frame.startDate, end: frame.endDate },
-        reducer,
-      });
-      frame.tileUrl = tileUrl;
-      addTileUrlLayer(this._map, tileUrl, { opacity: 1 }, 'ee-ts-source', 'ee-ts-layer');
-      this._setStatus(`Loaded ${frame.label}`);
-    } catch (error) {
-      this._setStatus(`Time series load failed: ${(error as Error).message}`);
-    }
-  }
-
-  private _inspectorPanel(): HTMLElement {
-    const el = this._panelShell('inspector', 'Inspector (MVP)');
-    const assetId = document.createElement('input');
-    assetId.className = 'plugin-control-input';
-    assetId.value = this._selectedAssetId;
-
-    const toggle = document.createElement('button');
-    toggle.className = 'plugin-control-button';
-    toggle.textContent = 'Enable map click inspector';
-
-    this._inspectorResultsEl = document.createElement('pre');
-    this._inspectorResultsEl.className = 'plugin-control-placeholder';
-    this._inspectorResultsEl.textContent = 'Inspector inactive';
-
-    toggle.addEventListener('click', () => {
-      this._selectedAssetId = assetId.value.trim() || this._selectedAssetId;
-      this._inspectorActive = !this._inspectorActive;
-      if (this._inspectorActive) {
-        this._enableInspector();
-        toggle.textContent = 'Disable map click inspector';
-      } else {
-        this._disableInspector();
-        toggle.textContent = 'Enable map click inspector';
-      }
-    });
-
-    el.append(assetId, toggle, this._inspectorResultsEl);
+    el.append(objectBtn, inspectPixel, clickToggle, this._inspectorResultsEl);
     return el;
   }
 
   private _enableInspector(): void {
-    if (!this._map) return;
-    const handler = async (e: { lngLat: { lng: number; lat: number } }) => {
-      if (!this._inspectorResultsEl) return;
-      const payload: EndpointInspectPayload = {
-        assetId: this._selectedAssetId,
-        lon: e.lngLat.lng,
-        lat: e.lngLat.lat,
-      };
-      try {
-        if (!this._endpointClient) {
-          this._inspectorResultsEl.textContent =
-            'Inspector endpoint unavailable. Request scaffold:\n' + JSON.stringify(payload, null, 2);
-          return;
-        }
-        const data = await this._endpointClient.inspectPixel(payload).catch(() => ({ notImplemented: true, payload }));
-        if (data.notImplemented) {
-          this._inspectorResultsEl.textContent =
-            'Inspector not implemented by endpoint. Payload preview:\n' + JSON.stringify(payload, null, 2);
-          return;
-        }
-        this._inspectorResultsEl.textContent = JSON.stringify(data, null, 2);
-      } catch (error) {
-        this._inspectorResultsEl.textContent = `Inspector error: ${(error as Error).message}`;
-      }
+    if (!this._map || this._inspectorClickHandler) return;
+    this._inspectorActive = true;
+    const canvas = this._map.getCanvas();
+    this._previousMapCursor = canvas.style.cursor;
+    canvas.style.cursor = 'crosshair';
+    this._inspectorClickHandler = async (e: { lngLat: { lng: number; lat: number } }) => {
+      const lon = e.lngLat.lng;
+      const lat = e.lngLat.lat;
+      if (this._inspectorLonInput) this._inspectorLonInput.value = String(Number(lon.toFixed(6)));
+      if (this._inspectorLatInput) this._inspectorLatInput.value = String(Number(lat.toFixed(6)));
+      await this._inspectPixelAt(lon, lat);
     };
-    this._mapClickHandler = handler;
-    this._map.on('click', handler as never);
-    this._setStatus('Inspector enabled. Click map to query pixel values.');
+    this._map.on('click', this._inspectorClickHandler as never);
+    this._setStatus('Map click inspector enabled.');
   }
 
   private _disableInspector(): void {
-    if (this._map && this._mapClickHandler) {
-      this._map.off('click', this._mapClickHandler as never);
+    if (this._map && this._inspectorClickHandler) {
+      this._map.off('click', this._inspectorClickHandler as never);
     }
-    this._mapClickHandler = undefined;
+    if (this._map && this._previousMapCursor !== undefined) {
+      this._map.getCanvas().style.cursor = this._previousMapCursor;
+    }
+    this._previousMapCursor = undefined;
+    this._inspectorClickHandler = undefined;
     this._inspectorActive = false;
-    if (this._inspectorResultsEl) this._inspectorResultsEl.textContent = 'Inspector inactive';
+  }
+
+  private async _inspectPixelAt(lon: number, lat: number): Promise<void> {
+    try {
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+        throw new Error('Enter valid longitude and latitude values.');
+      }
+      const scale = Number(this._inspectorScaleInput?.value || 30);
+      const image = this._runEeScript(this._inspectorImageScript?.value || "return ee.Image('USGS/SRTMGL1_003');") as {
+        reduceRegion: (params: Record<string, unknown>) => unknown;
+      };
+      if (typeof image.reduceRegion !== 'function') {
+        throw new Error('Pixel image script must return an ee.Image.');
+      }
+
+      await this.authenticate();
+      this._setStatus('Inspecting pixel...');
+      const values = image.reduceRegion({
+        reducer: ee.Reducer.first(),
+        geometry: ee.Geometry.Point([lon, lat]),
+        scale,
+        maxPixels: 100000000,
+      });
+      const result = await this._evaluateEeObject(values);
+      this._showInspectorResult({ lon, lat, scale, values: result });
+      this._setStatus('Pixel inspection complete.');
+    } catch (error) {
+      this._setStatus(`Pixel inspect failed: ${(error as Error).message}`);
+    }
+  }
+
+  private _showInspectorResult(result: unknown): void {
+    if (!this._inspectorResultsEl) return;
+    this._inspectorResultsEl.textContent =
+      typeof result === 'string' ? result : JSON.stringify(result, null, 2);
   }
 
   private _codePanel(): HTMLElement {
@@ -873,119 +1204,28 @@ export class PluginControl implements IControl {
     return el;
   }
 
-  private _exportPanel(): HTMLElement {
-    const el = this._panelShell('export', 'Export (MVP)');
-
-    const assetId = document.createElement('input');
-    assetId.className = 'plugin-control-input';
-    assetId.value = this._selectedAssetId;
-
-    const description = document.createElement('input');
-    description.className = 'plugin-control-input';
-    description.value = 'maplibre_ee_export';
-
-    const destination = document.createElement('select');
-    destination.className = 'plugin-control-input';
-    destination.innerHTML = '<option value="drive">drive</option><option value="cloud">cloud</option><option value="asset">asset</option>';
-
-    const payloadPreview = document.createElement('pre');
-    payloadPreview.className = 'plugin-control-placeholder';
-
-    const updatePreview = (): EndpointExportPayload => {
-      const payload: EndpointExportPayload = {
-        assetId: assetId.value.trim(),
-        description: description.value.trim(),
-        destination: destination.value as EndpointExportPayload['destination'],
-      };
-      payloadPreview.textContent = JSON.stringify(payload, null, 2);
-      return payload;
-    };
-
-    const submit = document.createElement('button');
-    submit.className = 'plugin-control-button';
-    submit.textContent = 'Submit export request';
-    submit.addEventListener('click', async () => {
-      const payload = updatePreview();
-      if (!this._endpointClient) {
-        this._setStatus('Export not implemented in tile-only/local mode. Payload preview shown.');
-        return;
-      }
-      try {
-        const response = await this._endpointClient.requestExport(payload).catch(() => ({ notImplemented: true, payload }));
-        if (response.notImplemented) {
-          this._setStatus('Export endpoint not implemented.');
-          return;
-        }
-        this._setStatus(`Export request submitted: ${JSON.stringify(response)}`);
-      } catch (error) {
-        this._setStatus(`Export failed: ${(error as Error).message}`);
-      }
-    });
-
-    [assetId, description, destination].forEach((input) => input.addEventListener('input', () => updatePreview()));
-    updatePreview();
-
-    el.append(assetId, description, destination, submit, payloadPreview);
-    return el;
-  }
-
-  private _settingsPanel(): HTMLElement {
-    const el = this._panelShell('settings', 'Settings');
-
-    const endpoint = document.createElement('input');
-    endpoint.className = 'plugin-control-input';
-    endpoint.value = this._tileEndpoint;
-    endpoint.placeholder = 'Tile endpoint URL';
-
-    const token = document.createElement('input');
-    token.className = 'plugin-control-input';
-    token.type = 'password';
-    token.value = this._tileEndpointToken;
-    token.placeholder = 'Optional bearer token';
-
-    const saveBtn = document.createElement('button');
-    saveBtn.className = 'plugin-control-button';
-    saveBtn.textContent = 'Save endpoint settings';
-    saveBtn.addEventListener('click', () => {
-      this._tileEndpoint = normalizeEndpointUrl(endpoint.value.trim());
-      endpoint.value = this._tileEndpoint;
-      this._tileEndpointToken = token.value.trim();
-      if (typeof window !== 'undefined') {
-        window.localStorage.setItem('eeTileEndpoint', this._tileEndpoint);
-        window.localStorage.setItem('eeTileEndpointToken', this._tileEndpointToken);
-      }
-      this._refreshEndpointClient();
-      const caps = this._endpointClient?.capabilities() ?? {};
-      this._setStatus(`Saved endpoint settings. Capabilities: ${JSON.stringify(caps)}`);
-    });
-
-    [
-      { label: 'Tile endpoint URL', input: endpoint },
-      { label: 'Bearer token (optional)', input: token },
-    ].forEach(({ label, input }) => {
-      const group = document.createElement('div');
-      group.className = 'plugin-control-group';
-      const lbl = document.createElement('label');
-      lbl.className = 'plugin-control-label';
-      lbl.textContent = label;
-      group.append(lbl, input);
-      el.appendChild(group);
-    });
-
-    const note = document.createElement('p');
-    note.className = 'plugin-control-placeholder';
-    note.textContent =
-      'Settings are persisted in localStorage. Use endpoint mode for Time Series, Inspector, and Export support.';
-
-    el.append(saveBtn, note);
-    return el;
-  }
-
   private _authPanel(): HTMLElement {
     const el = this._panelShell('auth', 'Earth Engine authentication');
+    const hasConfiguredOauthClient = Boolean(this._oauthClientId || this._options.accessToken);
+
+    const oauthClient = document.createElement('input');
+    oauthClient.className = 'plugin-control-input';
+    oauthClient.placeholder = 'Google OAuth client ID';
+    oauthClient.autocomplete = 'off';
+    oauthClient.value = this._oauthClientId;
+    if (hasConfiguredOauthClient) {
+      oauthClient.type = 'hidden';
+    }
+
     const project = document.createElement('input');
     project.className = 'plugin-control-input';
-    project.placeholder = 'Google Cloud project ID (optional)';
+    project.placeholder = 'Google Cloud project ID';
+    project.autocomplete = 'off';
+    project.value = this._projectId;
+    project.addEventListener('input', () => {
+      this._projectId = project.value.trim();
+      this._storeProjectId(this._projectId);
+    });
 
     const authStatus = document.createElement('div');
     authStatus.className = 'plugin-control-placeholder';
@@ -993,27 +1233,32 @@ export class PluginControl implements IControl {
 
     const btn = document.createElement('button');
     btn.className = 'plugin-control-button';
-    btn.textContent = 'Authenticate with EE_SERVICE_ACCOUNT';
+    btn.textContent = 'Sign in to Earth Engine';
     btn.addEventListener('click', async () => {
       try {
-        await this.authenticate(project.value.trim() || undefined);
+        await this.authenticate(project.value, oauthClient.value);
         authStatus.textContent = `Auth status: ${this._state.authenticated ? 'Authenticated' : 'Not authenticated'}`;
       } catch (error) {
-        this._setStatus(`Auth failed: ${(error as Error).message}`);
+        this.setState({ authenticated: false });
+        const message = (error as Error).message;
+        authStatus.textContent = `Auth status: Not authenticated. ${message}`;
+        this._setStatus(`Auth failed: ${message}`);
       }
     });
 
     const help = document.createElement('p');
     help.className = 'plugin-control-placeholder';
-    help.textContent =
-      'EE_SERVICE_ACCOUNT can be a JSON string or path to a service-account JSON key (Node/backend only).';
+    help.textContent = hasConfiguredOauthClient
+      ? 'Enter an Earth Engine-enabled Google Cloud project ID, then sign in with your Google account.'
+      : 'Enter an OAuth client ID and an Earth Engine-enabled Google Cloud project ID, then sign in with your Google account.';
 
-    el.append(project, btn, authStatus, help);
+    el.append(oauthClient, project, btn, authStatus, help);
     return el;
   }
 
   private _positionPanel(): void {
     if (!this._panel || !this._container || !this._mapContainer) return;
+    this._updateResizeHandlePlacement();
 
     const mapRect = this._mapContainer.getBoundingClientRect();
     const controlRect = this._container.getBoundingClientRect();
@@ -1023,9 +1268,9 @@ export class PluginControl implements IControl {
     const rightMargin = 0;
     const verticalGap = 8;
 
-    const position = this._options.position;
-    let left = edgeMargin;
-    let top = edgeMargin;
+    const position = this._actualControlPosition();
+    let left: number;
+    let top: number;
 
     if (position === 'top-right') {
       left = controlRect.right - mapRect.left - panelRect.width - rightMargin;
@@ -1055,6 +1300,7 @@ export class PluginControl implements IControl {
 
   private _setupEventListeners(): void {
     this._documentClickHandler = (e: MouseEvent) => {
+      if (this._inspectorActive) return;
       const target = e.target as Node;
       if (this._container && this._panel && !this._container.contains(target) && !this._panel.contains(target)) {
         this.collapse();
