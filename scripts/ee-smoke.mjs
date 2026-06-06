@@ -1,37 +1,36 @@
-import fs from 'node:fs';
 import ee from '@google/earthengine';
 
-function parseKey() {
-  const raw = process.env.EE_SERVICE_ACCOUNT;
-  if (!raw) return null;
-  const trimmed = raw.trim();
-  const content = trimmed.startsWith('{') ? trimmed : fs.existsSync(trimmed) ? fs.readFileSync(trimmed, 'utf8') : null;
-  if (!content) return null;
-  return JSON.parse(content);
-}
-
-async function main() {
-  const key = parseKey();
-  if (!key) {
-    console.log('SKIP: EE_SERVICE_ACCOUNT is not set (or invalid path).');
+async function authenticate() {
+  const accessToken = process.env.EE_ACCESS_TOKEN?.trim();
+  const projectId = process.env.EE_PROJECT_ID?.trim();
+  if (!accessToken || !projectId) {
+    console.log('SKIP: EE_ACCESS_TOKEN and EE_PROJECT_ID are required for the smoke test.');
     process.exit(0);
   }
 
   await new Promise((resolve, reject) => {
-    ee.data.authenticateViaPrivateKey(
-      { client_email: key.client_email, private_key: key.private_key },
-      () => ee.initialize(null, null, resolve, reject, key.project_id),
-      reject,
+    ee.data.setAuthToken(
+      '',
+      'Bearer',
+      accessToken,
+      3600,
+      [],
+      () => ee.initialize(null, null, resolve, reject, null, projectId),
+      false,
     );
   });
+  return projectId;
+}
 
+async function main() {
+  const projectId = await authenticate();
   const image = ee.Image('USGS/SRTMGL1_003');
   const mapInfo = await new Promise((resolve, reject) => {
     image.getMapId({ min: 0, max: 3000 }, (info) => resolve(info));
     setTimeout(() => reject(new Error('Timeout waiting for mapid.')), 15000);
   });
 
-  console.log('OK: Authenticated and fetched map tiles.');
+  console.log(`OK: Authenticated and fetched map tiles for project ${projectId}.`);
   console.log(`Tile URL: ${mapInfo.urlFormat}`);
 }
 

@@ -9,6 +9,12 @@ export interface PluginControlOptions {
   panelWidth?: number;
   maxHeight?: number | string;
   className?: string;
+  storagePrefix?: string;
+  oauthClientId?: string;
+  projectId?: string;
+  accessToken?: string;
+  tokenType?: string;
+  tokenExpiresIn?: number;
 }
 
 export interface PluginState {

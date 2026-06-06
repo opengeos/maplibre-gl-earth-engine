@@ -5,6 +5,10 @@ import { PluginControlReact, usePluginState } from '../../src/react';
 import '../../src/index.css';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
+function envString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
 /**
  * Main App component demonstrating the React integration
  */
@@ -39,7 +43,7 @@ function App() {
     };
   }, []);
 
-  const handleStateChange = (_newState: typeof state) => {};
+  const handleStateChange = () => {};
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
@@ -72,6 +76,8 @@ function App() {
           title="React Plugin"
           collapsed={state.collapsed}
           panelWidth={320}
+          oauthClientId={envString(import.meta.env.VITE_GEE_OAUTH_CLIENT_ID)}
+          projectId={envString(import.meta.env.VITE_GEE_PROJECT_ID)}
           onStateChange={handleStateChange}
         />
       )}

@@ -1,71 +1,186 @@
 import ee from '@google/earthengine';
 
-export interface ServiceAccountKey {
-  client_email: string;
-  private_key: string;
-  project_id?: string;
+export interface EarthEngineAuthOptions {
+  oauthClientId?: string;
+  projectId?: string;
+  accessToken?: string;
+  tokenType?: string;
+  tokenExpiresIn?: number;
+  force?: boolean;
 }
 
 export interface AuthResult {
   ok: boolean;
   message: string;
   projectId?: string;
+  authenticated: boolean;
 }
 
-export function parseServiceAccountFromEnv(envValue?: string): ServiceAccountKey | null {
-  const value = envValue ?? (typeof process !== 'undefined' ? process.env.EE_SERVICE_ACCOUNT : undefined);
-  if (!value) return null;
+let authPromise: Promise<void> | null = null;
+let initializePromise: Promise<AuthResult> | null = null;
+let initialized = false;
+let initializedProjectId: string | undefined;
 
-  const trimmed = value.trim();
-  const isJson = trimmed.startsWith('{');
-  const raw = isJson ? trimmed : readFileIfAvailable(trimmed);
-  if (!raw) return null;
+function exposeEarthEngineGlobal(): void {
+  const scope = globalThis as typeof globalThis & { ee?: unknown };
+  if (!scope.ee) {
+    scope.ee = ee;
+  }
+}
 
-  const parsed = JSON.parse(raw) as Partial<ServiceAccountKey>;
-  if (!parsed.client_email || !parsed.private_key) {
-    throw new Error('EE_SERVICE_ACCOUNT JSON must include client_email and private_key');
+function normalizeOptionalString(value: unknown): string | undefined {
+  const text = String(value ?? '').trim();
+  return text ? text : undefined;
+}
+
+function normalizeTokenExpiresIn(value: unknown): number {
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 3600;
+}
+
+function eeErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object' && 'message' in error) {
+    return String((error as { message: unknown }).message);
+  }
+  return String(error ?? 'Unknown Earth Engine error');
+}
+
+function formatEeInitializeError(error: unknown): string {
+  const message = eeErrorMessage(error);
+  if (message.includes("Cannot use 'in' operator") && message.includes('Classifier')) {
+    return [
+      'Earth Engine initialization failed while loading the API algorithms registry.',
+      'Verify that the configured Google Cloud project has Earth Engine enabled,',
+      'the OAuth consent/client origin matches this page, and the signed-in account has Earth Engine access.',
+      `Original error: ${message}`,
+    ].join(' ');
+  }
+  return message;
+}
+
+function setAuthToken(options: EarthEngineAuthOptions, accessToken: string): Promise<void> {
+  if (!ee.data?.setAuthToken) {
+    throw new Error('Earth Engine token authentication is unavailable.');
+  }
+  const oauthClientId = normalizeOptionalString(options.oauthClientId) ?? '';
+  const tokenType = normalizeOptionalString(options.tokenType) ?? 'Bearer';
+  const tokenExpiresIn = normalizeTokenExpiresIn(options.tokenExpiresIn);
+  return new Promise((resolve, reject) => {
+    try {
+      ee.data.setAuthToken(oauthClientId, tokenType, accessToken, tokenExpiresIn, [], resolve, false);
+    } catch (error) {
+      reject(new Error(eeErrorMessage(error)));
+    }
+  });
+}
+
+async function ensureAuthenticated(options: EarthEngineAuthOptions): Promise<void> {
+  const accessToken = normalizeOptionalString(options.accessToken);
+  const oauthClientId = normalizeOptionalString(options.oauthClientId);
+  if (accessToken) {
+    await setAuthToken(options, accessToken);
+    return;
   }
 
-  return {
-    client_email: parsed.client_email,
-    private_key: parsed.private_key,
-    project_id: parsed.project_id,
-  };
-}
-
-function readFileIfAvailable(filePath: string): string | null {
-  if (typeof process === 'undefined' || process.release?.name !== 'node') return null;
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const fs = require('node:fs') as typeof import('node:fs');
-  if (!fs.existsSync(filePath)) return null;
-  return fs.readFileSync(filePath, 'utf8');
-}
-
-export async function authenticateWithServiceAccount(projectId?: string): Promise<AuthResult> {
-  const key = parseServiceAccountFromEnv();
-  if (!key) {
-    return { ok: false, message: 'EE_SERVICE_ACCOUNT is not set.' };
+  const token = ee.data?.getAuthToken?.();
+  const currentAuthClientId = normalizeOptionalString(ee.data?.getAuthClientId?.());
+  if (token) {
+    if (!oauthClientId || (currentAuthClientId && currentAuthClientId === oauthClientId)) {
+      return;
+    }
+    ee.data?.clearAuthToken?.();
   }
 
-  const targetProject = projectId || key.project_id;
-  await new Promise<void>((resolve, reject) => {
-    ee.data.authenticateViaPrivateKey(
-      {
-        client_email: key.client_email,
-        private_key: key.private_key,
-      },
-      () => {
-        ee.initialize(null, null, () => resolve(), (e: unknown) => reject(e), targetProject);
-      },
-      (e: unknown) => reject(e),
-    );
+  if (authPromise) {
+    return authPromise;
+  }
+  if (!oauthClientId) {
+    throw new Error('Earth Engine OAuth client ID is required.');
+  }
+  if (!ee.data?.authenticateViaOauth) {
+    throw new Error('Earth Engine OAuth authentication is unavailable.');
+  }
+
+  const promise: Promise<void> = new Promise<void>((resolve, reject) => {
+    const onSuccess = () => resolve();
+    const onFailure = (error: unknown) => reject(new Error(eeErrorMessage(error)));
+    const onImmediateFailed = () => {
+      if (!ee.data?.authenticateViaPopup) {
+        reject(new Error('Earth Engine popup authentication is unavailable.'));
+        return;
+      }
+      ee.data.authenticateViaPopup(onSuccess, onFailure);
+    };
+
+    ee.data.authenticateViaOauth(oauthClientId, onSuccess, onFailure, undefined, onImmediateFailed);
+  }).finally(() => {
+    authPromise = null;
+  });
+  authPromise = promise;
+  return promise;
+}
+
+function initializeEarthEngine(projectId?: string): Promise<void> {
+  if (!ee.initialize) {
+    throw new Error('Earth Engine initialize is unavailable.');
+  }
+  exposeEarthEngineGlobal();
+  return new Promise((resolve, reject) => {
+    try {
+      ee.initialize(
+        null,
+        null,
+        () => resolve(),
+        (error: unknown) => reject(new Error(formatEeInitializeError(error))),
+        null,
+        projectId || null,
+      );
+    } catch (error) {
+      reject(new Error(formatEeInitializeError(error)));
+    }
+  });
+}
+
+export async function authenticateWithOAuth(options: EarthEngineAuthOptions = {}): Promise<AuthResult> {
+  const projectId = normalizeOptionalString(options.projectId);
+  const projectMatches = initializedProjectId === projectId || (!initializedProjectId && !projectId);
+  if (initialized && projectMatches && !options.force) {
+    return {
+      ok: true,
+      projectId,
+      authenticated: true,
+      message: projectId
+        ? `Authenticated with Google account (project: ${projectId}).`
+        : 'Authenticated with Google account.',
+    };
+  }
+
+  if (initializePromise && !options.force) {
+    return initializePromise;
+  }
+
+  initializePromise = (async () => {
+    await ensureAuthenticated(options);
+    await initializeEarthEngine(projectId);
+    initialized = true;
+    initializedProjectId = projectId;
+    return {
+      ok: true,
+      projectId,
+      authenticated: true,
+      message: projectId
+        ? `Authenticated with Google account (project: ${projectId}).`
+        : 'Authenticated with Google account.',
+    };
+  })().catch((error) => {
+    initialized = false;
+    initializedProjectId = undefined;
+    throw error;
+  }).finally(() => {
+    initializePromise = null;
   });
 
-  return {
-    ok: true,
-    projectId: targetProject,
-    message: targetProject
-      ? `Authenticated with service account (project: ${targetProject}).`
-      : 'Authenticated with service account.',
-  };
+  return initializePromise;
 }

@@ -3,6 +3,10 @@ import { PluginControl } from '../../src/index';
 import '../../src/index.css';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
+function envString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
 // Create map
 const map = new maplibregl.Map({
   container: 'map',
@@ -28,12 +32,12 @@ map.on('load', () => {
     title: 'Earth Engine',
     collapsed: false,
     panelWidth: 380,
+    oauthClientId: envString(import.meta.env.VITE_GEE_OAUTH_CLIENT_ID),
+    projectId: envString(import.meta.env.VITE_GEE_PROJECT_ID),
   });
 
   // Add control to the map
   map.addControl(pluginControl, 'top-right');
-
-
 
   pluginControl.on('collapse', () => {
     console.log('Plugin panel collapsed');
