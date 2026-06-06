@@ -28,6 +28,23 @@ function exposeEarthEngineGlobal(): void {
   }
 }
 
+function syncGeneratedEeClasses(): void {
+  // The Earth Engine browser build attaches runtime-generated classes such as
+  // ee.Reducer and ee.Kernel to globalThis.ee during ee.initialize(), not to the
+  // module export. When globalThis.ee is a different object (for example a
+  // script-tag copy of the API or another bundled instance), copy the generated
+  // classes onto the imported module so code like ee.Reducer.first() works.
+  const scope = globalThis as typeof globalThis & { ee?: Record<string, unknown> };
+  const globalEe = scope.ee;
+  const moduleEe = ee as unknown as Record<string, unknown>;
+  if (!globalEe || typeof globalEe !== 'object' || globalEe === moduleEe) return;
+  for (const name of Object.keys(globalEe)) {
+    if (!(name in moduleEe)) {
+      moduleEe[name] = globalEe[name];
+    }
+  }
+}
+
 function normalizeOptionalString(value: unknown): string | undefined {
   const text = String(value ?? '').trim();
   return text ? text : undefined;
@@ -132,7 +149,10 @@ function initializeEarthEngine(projectId?: string): Promise<void> {
       ee.initialize(
         null,
         null,
-        () => resolve(),
+        () => {
+          syncGeneratedEeClasses();
+          resolve();
+        },
         (error: unknown) => reject(new Error(formatEeInitializeError(error))),
         null,
         projectId || null,

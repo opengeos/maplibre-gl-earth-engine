@@ -211,6 +211,36 @@ describe('PluginControl', () => {
     expect(inspectorPanel!.querySelector('pre')?.textContent).toContain('"B1": 42');
   });
 
+  it('surfaces Earth Engine evaluation errors from point inspection', async () => {
+    const mapContainer = document.createElement('div');
+    document.body.appendChild(mapContainer);
+
+    const map = createMapMock(mapContainer);
+    const control = new PluginControl({
+      collapsed: true,
+      oauthClientId: 'oauth-client',
+      projectId: 'ee-project',
+    });
+    control.onAdd(map as never);
+
+    await control.loadAsset('USGS/SRTMGL1_003', {});
+
+    // The real ee evaluate() invokes a single callback as callback(value, error).
+    mocks.reduceRegion.mockReturnValueOnce({
+      evaluate: (callback: (value: unknown, error?: unknown) => void) =>
+        callback(undefined, 'Image.reduceRegion: User memory limit exceeded.'),
+    });
+
+    await (control as unknown as { _inspectPixelAt: (lon: number, lat: number) => Promise<void> })._inspectPixelAt(
+      -122.292,
+      37.901,
+    );
+
+    const status = document.querySelector('.plugin-control-status')?.textContent ?? '';
+    expect(status).toContain('Point inspect failed');
+    expect(status).toContain('User memory limit exceeded');
+  });
+
   it('inspects feature collection layers at the clicked point', async () => {
     const mapContainer = document.createElement('div');
     document.body.appendChild(mapContainer);
