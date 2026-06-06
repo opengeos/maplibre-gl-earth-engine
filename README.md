@@ -27,11 +27,11 @@ MapLibre GL JS plugin for Earth Engine dataset discovery, authentication, and la
   - Change raster opacity
   - Select and remove layers
 - **Inspector**
-  - Inspect script-returned Earth Engine objects
-  - Inspect pixel values from script-returned `ee.Image` objects
+  - Inspect added Earth Engine layers directly
+  - Inspect pixel values from added image/image collection layers and features from added feature collection layers
   - Use explicit lon/lat inputs or map clicks
 - **Code**
-  - Run EE script snippets
+  - Run EE script snippets, including Code Editor-style `Map.addLayer`, `Map.setCenter`, and `Map.centerObject` calls
 - **Auth**
   - Sign in with Google account OAuth
   - Enter Earth Engine Google Cloud project ID
