@@ -1,6 +1,6 @@
 {
   "name": "maplibre-gl-earth-engine",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "MapLibre GL control for Google Earth Engine catalog discovery, authentication, and layer rendering",
   "type": "module",
   "main": "./dist/index.cjs",

@@ -720,7 +720,8 @@ export class PluginControl implements IControl {
 
   private _createContainer(): HTMLElement {
     const container = document.createElement('div');
-    container.className = `maplibregl-ctrl maplibregl-ctrl-group plugin-control ${this._options.className}`.trim();
+    container.className =
+      `maplibregl-ctrl maplibregl-ctrl-group plugin-control earth-engine-control ${this._options.className}`.trim();
 
     const toggleBtn = document.createElement('button');
     toggleBtn.className = 'plugin-control-toggle';
@@ -734,7 +735,7 @@ export class PluginControl implements IControl {
 
   private _createPanel(): HTMLElement {
     const panel = document.createElement('div');
-    panel.className = 'plugin-control-panel';
+    panel.className = 'plugin-control-panel earth-engine-panel';
     panel.style.width = `${this._options.panelWidth}px`;
     panel.style.maxHeight =
       typeof this._options.maxHeight === 'number' ? `${this._options.maxHeight}px` : this._options.maxHeight;

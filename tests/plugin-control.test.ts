@@ -80,6 +80,25 @@ afterEach(() => {
 });
 
 describe('PluginControl', () => {
+  it('marks the container and panel with package-unique scope classes', () => {
+    const mapContainer = document.createElement('div');
+    document.body.appendChild(mapContainer);
+
+    const control = new PluginControl({ collapsed: true, className: 'custom-class' });
+    const container = control.onAdd(createMapMock(mapContainer) as never);
+
+    expect(container.classList.contains('plugin-control')).toBe(true);
+    expect(container.classList.contains('earth-engine-control')).toBe(true);
+    // User-supplied className option is preserved alongside the marker class.
+    expect(container.classList.contains('custom-class')).toBe(true);
+
+    const panel = document.querySelector<HTMLElement>('.plugin-control-panel');
+    expect(panel).toBeTruthy();
+    expect(panel!.classList.contains('earth-engine-panel')).toBe(true);
+
+    control.onRemove();
+  });
+
   it('uses the Auth tab project ID when no project ID option is configured', async () => {
     const mapContainer = document.createElement('div');
     document.body.appendChild(mapContainer);
