@@ -52,5 +52,3 @@
 .earth-engine-panel .plugin-layer-opacity { flex:0 0 auto; width:100px; min-width:100px; max-width:100px; height:16px; margin:0; cursor:pointer; }
 .earth-engine-panel .plugin-layer-icon-button { width:24px; height:24px; border:1px solid var(--ee-panel-border-strong); border-radius:5px; background:var(--ee-input-bg); color:var(--ee-button-danger); line-height:1; cursor:pointer; }
 .earth-engine-panel .plugin-inspector-output { max-height:220px; overflow:auto; border:1px solid var(--ee-panel-border); border-radius:6px; padding:8px; background:var(--ee-panel-elevated); color:var(--ee-panel-text); }
-</content>
-</invoke>
