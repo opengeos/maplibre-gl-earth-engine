@@ -32,6 +32,7 @@
 .earth-engine-panel .plugin-control-input { width:100%; box-sizing:border-box; padding:6px; border:1px solid var(--ee-panel-border-strong); border-radius:5px; background:var(--ee-input-bg); color:var(--ee-input-text); font-size:12px; margin-bottom:6px; }
 .earth-engine-panel .plugin-control-input::placeholder { color:var(--ee-panel-placeholder); opacity:1; }
 .earth-engine-panel .plugin-control-button { border:none; background:var(--ee-button-primary); color:#fff; border-radius:5px; padding:7px 10px; cursor:pointer; font-size:12px; margin-right:6px; margin-top:4px; }
+.earth-engine-panel .plugin-control-button:disabled { opacity:0.55; cursor:not-allowed; }
 .earth-engine-panel .plugin-control-button-muted { background:var(--ee-button-muted); }
 .earth-engine-panel .plugin-control-button-danger { background:var(--ee-button-danger); }
 .earth-engine-panel .plugin-control-placeholder { font-size:12px; color:var(--ee-panel-placeholder); white-space:pre-wrap; }

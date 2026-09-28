@@ -312,4 +312,47 @@ describe('PluginControl', () => {
     expect(output).not.toContain('"geometry"');
     expect(output).not.toContain('"coordinates"');
   });
+  it('highlights the clicked catalog dataset and shows its details as text', () => {
+    const mapContainer = document.createElement('div');
+    document.body.appendChild(mapContainer);
+    const control = new PluginControl({ collapsed: true });
+    control.onAdd(createMapMock(mapContainer) as never);
+
+    const scrolled: Element[] = [];
+    const scrollIntoView = vi.fn(function (this: Element) {
+      scrolled.push(this);
+    });
+    Element.prototype.scrollIntoView = scrollIntoView;
+    const internals = control as unknown as {
+      _catalog: unknown[];
+      _catalogRefreshHandlers: Array<() => void>;
+    };
+    internals._catalog = [
+      { id: 'A/one', title: 'Alpha <img src=x onerror=alert(1)>', source: 'official', tags: [], category: 'Land' },
+      { id: 'B/two', title: 'Beta', source: 'official', tags: ['dem'], category: 'Land' },
+    ];
+    internals._catalogRefreshHandlers.forEach((render) => render());
+
+    const panel = document.querySelector('.plugin-tab-panel[data-tab="catalog"]') ?? document.body;
+    const items = [...panel.querySelectorAll<HTMLButtonElement>('.plugin-list-item')];
+    const useInLoad = [...panel.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent === 'Use in Load tab',
+    )!;
+    expect(items).toHaveLength(2);
+    expect(useInLoad.disabled).toBe(true);
+
+    items[1].click();
+    expect(items[1].classList.contains('active')).toBe(true);
+    expect(items[1].getAttribute('aria-pressed')).toBe('true');
+    expect(items[0].classList.contains('active')).toBe(false);
+    expect(useInLoad.disabled).toBe(false);
+    expect(scrolled[0]?.contains(useInLoad)).toBe(true);
+
+    items[0].click();
+    expect(items[0].classList.contains('active')).toBe(true);
+    expect(items[1].classList.contains('active')).toBe(false);
+    const details = panel.querySelector('.plugin-detail')!;
+    expect(details.querySelector('img')).toBeNull();
+    expect(details.textContent).toContain('Alpha <img src=x onerror=alert(1)>');
+  });
 });
