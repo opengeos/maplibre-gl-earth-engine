@@ -918,28 +918,58 @@ export class PluginControl implements IControl {
     openDatasetBtn.textContent = 'Open dataset page';
     openDatasetBtn.disabled = true;
 
+    // Buttons of the category list, so the clicked one can be highlighted.
+    let itemButtons: Array<{ item: CatalogItem; btn: HTMLButtonElement }> = [];
+
     const renderDetails = (item?: CatalogItem): void => {
+      for (const entry of itemButtons) {
+        const selected = entry.item === item;
+        entry.btn.classList.toggle('active', selected);
+        entry.btn.setAttribute('aria-pressed', String(selected));
+      }
       if (!item) {
         details.textContent = 'Select a dataset to see details.';
         openDatasetBtn.disabled = true;
+        populateLoadBtn.disabled = true;
         return;
       }
       this._selectedCatalogItem = item;
       openDatasetBtn.disabled = false;
-      details.innerHTML = `
-        <div><strong>${item.title}</strong></div>
-        <div>ID: ${item.id}</div>
-        <div>Provider: ${item.provider ?? 'Unknown'}</div>
-        <div>Type: ${item.type ?? 'Unknown'}</div>
-        <div>Source: ${item.source}</div>
-        <div>Tags: ${item.tags.join(', ') || 'None'}</div>
-        <div>${item.snippet ?? 'No description available.'}</div>
-      `;
+      populateLoadBtn.disabled = false;
+      // Built from text nodes: catalog entries come from remote JSON and must
+      // never be parsed as HTML.
+      const line = (text: string, strong = false): HTMLDivElement => {
+        const div = document.createElement('div');
+        if (strong) {
+          const b = document.createElement('strong');
+          b.textContent = text;
+          div.appendChild(b);
+        } else {
+          div.textContent = text;
+        }
+        return div;
+      };
+      details.replaceChildren(
+        line(item.title, true),
+        line(`ID: ${item.id}`),
+        line(`Provider: ${item.provider ?? 'Unknown'}`),
+        line(`Type: ${item.type ?? 'Unknown'}`),
+        line(`Source: ${item.source}`),
+        line(`Tags: ${item.tags.join(', ') || 'None'}`),
+        line(item.snippet ?? 'No description available.'),
+      );
+      // The details and actions sit below the (long) list; bring them into
+      // view so the click visibly does something.
+      detailsSection.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
     };
 
     const populateLoadBtn = document.createElement('button');
     populateLoadBtn.className = 'plugin-control-button plugin-control-button-muted';
     populateLoadBtn.textContent = 'Use in Load tab';
+    populateLoadBtn.disabled = true;
+    const detailsSection = document.createElement('div');
+    detailsSection.className = 'plugin-detail-section';
+    detailsSection.append(details, populateLoadBtn, openDatasetBtn);
     populateLoadBtn.addEventListener('click', () => {
       if (!this._selectedCatalogItem) return;
       this._selectedAssetId = this._selectedCatalogItem.id;
@@ -968,6 +998,7 @@ export class PluginControl implements IControl {
       count.textContent = `Result count: ${filtered.total}`;
 
       const grouped = groupCatalogByCategory(filtered.items);
+      itemButtons = [];
       const groups = Object.keys(grouped)
         .sort()
         .map((category) => {
@@ -983,7 +1014,9 @@ export class PluginControl implements IControl {
             btn.className = 'plugin-list-item';
             btn.type = 'button';
             btn.textContent = item.title;
+            btn.setAttribute('aria-pressed', 'false');
             btn.addEventListener('click', () => renderDetails(item));
+            itemButtons.push({ item, btn });
             wrap.appendChild(btn);
           });
           return wrap;
@@ -1000,7 +1033,7 @@ export class PluginControl implements IControl {
       await this._ensureCatalogsFetched();
     });
 
-    el.append(sourceSelect, fetchBtn, count, categoryList, details, populateLoadBtn, openDatasetBtn);
+    el.append(sourceSelect, fetchBtn, count, categoryList, detailsSection);
     this._catalogRefreshHandlers.push(renderCatalog);
     renderDetails();
     return el;
